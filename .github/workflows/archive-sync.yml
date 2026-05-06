@@ -1,0 +1,56 @@
+name: Archive Sync
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 3 * * *"
+
+permissions:
+  contents: write
+
+jobs:
+  archive:
+    runs-on: ubuntu-latest
+    env:
+      MAX_PACKAGES: ${{ vars.MAX_PACKAGES || '' }}
+      ARCHIVE_ORG_IDENTIFIER: ${{ secrets.ARCHIVE_ORG_IDENTIFIER }}
+      ARCHIVE_ORG_ACCESS_KEY: ${{ secrets.ARCHIVE_ORG_ACCESS_KEY }}
+      ARCHIVE_ORG_SECRET_KEY: ${{ secrets.ARCHIVE_ORG_SECRET_KEY }}
+      ARCHIVE_ORG_COLLECTION: ${{ vars.ARCHIVE_ORG_COLLECTION || 'opensource' }}
+      ARCHIVE_ORG_TITLE: ${{ vars.ARCHIVE_ORG_TITLE || 'Nim Package Archive' }}
+      ARCHIVE_ORG_DESCRIPTION: ${{ vars.ARCHIVE_ORG_DESCRIPTION || 'Automated archive of Nim package source snapshots, metadata, README files, and licenses.' }}
+      ARCHIVE_ORG_CREATOR: ${{ vars.ARCHIVE_ORG_CREATOR || 'NimArchive' }}
+      ARCHIVE_ORG_MEDIATYPE: ${{ vars.ARCHIVE_ORG_MEDIATYPE || 'data' }}
+      ARCHIVE_ORG_LICENSEURL: ${{ vars.ARCHIVE_ORG_LICENSEURL || '' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install sync dependency
+        run: python -m pip install --upgrade pip internetarchive
+
+      - name: Run archiver
+        run: python -m nimarchive.archiver
+
+      - name: Commit archive updates
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add archive
+          if git diff --cached --quiet; then
+            echo "No archive changes to commit"
+            exit 0
+          fi
+          git commit -m "chore: refresh archived packages"
+          git push
+
+      - name: Sync to archive.org
+        if: ${{ env.ARCHIVE_ORG_IDENTIFIER != '' && env.ARCHIVE_ORG_ACCESS_KEY != '' && env.ARCHIVE_ORG_SECRET_KEY != '' }}
+        run: python -m nimarchive.sync_archive_org
