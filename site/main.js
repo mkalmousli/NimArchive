@@ -2,8 +2,7 @@
     async function fetchData() {
         try {
             await withLoadingToast("Loading packages...", async () => {
-                const res = await fetch(`${CONFIG.archiveBaseUrl}/index.json`);
-                state.packages = await res.json();
+                state.packages = await fetchArchiveJson("index.json");
                 renderPackageList();
                 if (!state.selectedPackage) {
                     const packageNames = Object.keys(state.packages);

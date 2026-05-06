@@ -168,20 +168,16 @@ async function renderPackageDetail(name) {
         let latestCode = "";
 
         try {
-            const latestRes = await fetch(`${CONFIG.archiveBaseUrl}/packages/${pkg.id}/code/latest.json`);
-            const latestData = await latestRes.json();
+            const latestData = await fetchArchiveJson(`packages/${pkg.id}/code/latest.json`);
             latestCode = latestData.code;
             latestPath = `${CONFIG.archiveBaseUrl}/packages/${pkg.id}/code/${latestCode}`;
-            const metaRes = await fetch(`${latestPath}/metadata.json`);
-            latestMeta = await metaRes.json();
+            latestMeta = await fetchArchiveJson(`packages/${pkg.id}/code/${latestCode}/metadata.json`);
         } catch(e) {}
         try {
-            const allRes = await fetch(`${CONFIG.archiveBaseUrl}/packages/${pkg.id}/code/all.json`);
-            historyData = await allRes.json();
+            historyData = await fetchArchiveJson(`packages/${pkg.id}/code/all.json`);
         } catch(e) {}
         try {
-            const vRes = await fetch(`${CONFIG.archiveBaseUrl}/packages/${pkg.id}/versions/all.json`);
-            const versionsData = await vRes.json();
+            const versionsData = await fetchArchiveJson(`packages/${pkg.id}/versions/all.json`);
             versionTags = Array.isArray(versionsData.versions) ? versionsData.versions : [];
         } catch(e) {}
 
@@ -271,8 +267,7 @@ async function renderPackageDetail(name) {
         const getVersionEntries = async (tag) => {
         if (versionIdCache.has(tag)) return versionIdCache.get(tag);
         try {
-            const res = await fetch(`${CONFIG.archiveBaseUrl}/packages/${pkg.id}/versions/${tag}/all.json`);
-            const data = await res.json();
+            const data = await fetchArchiveJson(`packages/${pkg.id}/versions/${tag}/all.json`);
             const ids = Array.isArray(data.versions) ? data.versions : [];
             const entries = [];
 
@@ -282,8 +277,7 @@ async function renderPackageDetail(name) {
 
                 if (!label) {
                     try {
-                        const metaRes = await fetch(`${CONFIG.archiveBaseUrl}/packages/${pkg.id}/versions/${tag}/${id}/metadata.json`);
-                        const meta = await metaRes.json();
+                        const meta = await fetchArchiveJson(`packages/${pkg.id}/versions/${tag}/${id}/metadata.json`);
                         label = new Date(meta.archived_at * 1000).toLocaleString([], { dateStyle: "medium", timeStyle: "short" });
                     } catch(e) {
                         label = id;
@@ -318,8 +312,7 @@ async function renderPackageDetail(name) {
             const path = `${CONFIG.archiveBaseUrl}/packages/${pkg.id}/versions/${selectedVersion}/${selectedVersionId}`;
             let meta = null;
             try {
-                const metaRes = await fetch(`${path}/metadata.json`);
-                meta = await metaRes.json();
+                meta = await fetchArchiveJson(`packages/${pkg.id}/versions/${selectedVersion}/${selectedVersionId}/metadata.json`);
             } catch(e) {}
             selectedMeta = meta;
             selectedPath = path;
@@ -353,7 +346,8 @@ async function renderPackageDetail(name) {
             const contentBox = create("div", wrapper, { padding: "0 8px", fontSize: isReadme ? "12px" : "11px", lineHeight: "1.5" });
             const rawBox = create("pre", wrapper, { display: "none", padding: "0 8px", fontSize: "11px", fontFamily: CONFIG.fonts.mono, whiteSpace: "pre-wrap", margin: "0" });
             
-            const txt = await fetch(`${selectedPath}/${fileName}`).then(r => r.text());
+            const relativePath = selectedPath.replace(`${CONFIG.archiveBaseUrl}/`, "");
+            const txt = await fetchArchiveText(`${relativePath}/${fileName}`);
             if (renderAsMarkdown) {
                 renderMarkdown(txt, contentBox);
             } else {
@@ -411,8 +405,8 @@ async function renderPackageDetail(name) {
 async function renderHistoryItem(container, basePath, isCompact = false) {
     const theme = CONFIG[state.theme];
     try {
-        const res = await fetch(`${basePath}/metadata.json`);
-        const meta = await res.json();
+        const relativePath = basePath.replace(`${CONFIG.archiveBaseUrl}/`, "");
+        const meta = await fetchArchiveJson(`${relativePath}/metadata.json`);
         const item = create("div", container, { display: "flex", justifyContent: "space-between", alignItems: "center", padding: isCompact ? "4px 8px" : "8px 12px", borderBottom: isCompact ? "none" : `1px solid ${theme.border}`, fontSize: "11px" });
         const left = create("div", item, { display: "flex", gap: "12px", alignItems: "center" });
         create("div", left, { fontFamily: CONFIG.fonts.mono, color: theme.dim, padding: "1px 5px", backgroundColor: theme.bg, border: `1px solid ${theme.border}`, borderRadius: "3px", fontSize: "10px" }).textContent = meta.commit.substring(0, 7);

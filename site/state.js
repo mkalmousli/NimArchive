@@ -1,5 +1,6 @@
 const CONFIG = {
     archiveBaseUrl: "https://archive.org/download/NimPackagesArchive",
+    corsProxyUrl: "https://api.allorigins.win/raw?url=",
     primary: "#3b82f6",
     light: {
         bg: "#ffffff",
@@ -48,4 +49,20 @@ function create(tag, parent, styles = {}) {
 function addHover(el, normalStyles, hoverStyles) {
     el.addEventListener("mouseenter", () => s(el, hoverStyles));
     el.addEventListener("mouseleave", () => s(el, normalStyles));
+}
+
+function proxiedArchiveUrl(path) {
+    return `${CONFIG.corsProxyUrl}${encodeURIComponent(`${CONFIG.archiveBaseUrl}/${path}`)}`;
+}
+
+async function fetchArchiveText(path) {
+    const response = await fetch(proxiedArchiveUrl(path));
+    if (!response.ok) {
+        throw new Error(`Archive fetch failed: ${response.status}`);
+    }
+    return response.text();
+}
+
+async function fetchArchiveJson(path) {
+    return JSON.parse(await fetchArchiveText(path));
 }
