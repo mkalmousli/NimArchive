@@ -200,8 +200,10 @@ class GitRepoStore:
         self.repo_slug = os.environ.get("DATA_REPO_SLUG", DEFAULT_DATA_REPO_SLUG).strip() or DEFAULT_DATA_REPO_SLUG
         self.branch = os.environ.get("DATA_REPO_BRANCH", DEFAULT_DATA_REPO_BRANCH).strip() or DEFAULT_DATA_REPO_BRANCH
         self.push_token = os.environ.get("DATA_REPO_PUSH_TOKEN", "").strip()
+        if not self.push_token:
+            raise RuntimeError("Missing required environment variable: DATA_REPO_PUSH_TOKEN")
         self.clone_url = os.environ.get("DATA_REPO_CLONE_URL", "").strip() or build_github_repo_url(self.repo_slug)
-        self.push_url = os.environ.get("DATA_REPO_PUSH_URL", "").strip() or build_github_repo_url(self.repo_slug, self.push_token or None)
+        self.push_url = os.environ.get("DATA_REPO_PUSH_URL", "").strip() or build_github_repo_url(self.repo_slug, self.push_token)
         self.temp_dir = tempfile.mkdtemp(prefix="archive_data_repo_")
         self.repo_dir = os.path.join(self.temp_dir, "repo")
         self.lock = threading.Lock()
@@ -236,6 +238,7 @@ class GitRepoStore:
 
         configure_git_identity(self.repo_dir)
         run_command(["git", "remote", "set-url", "--push", "origin", self.push_url], cwd=self.repo_dir, check=False)
+        logging.info("Configured data repo push remote for %s on branch %s.", self.repo_slug, self.branch)
 
     def load_json(self, remote_name, default=None):
         with self.lock:
