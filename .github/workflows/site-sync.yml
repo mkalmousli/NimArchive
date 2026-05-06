@@ -1,21 +1,17 @@
-name: Archive Sync
+name: Site Sync
 
 on:
   workflow_dispatch:
-  schedule:
-    - cron: "0 */5 * * *"
+  issue_comment:
+    types:
+      - created
 
 permissions:
   contents: write
 
 jobs:
-  archive:
+  site:
     runs-on: ubuntu-latest
-    env:
-      MAX_PACKAGES: ${{ vars.MAX_PACKAGES || '' }}
-      DATA_REPO_SLUG: ${{ vars.DATA_REPO_SLUG || 'mkalmousli/NimArchiveData' }}
-      DATA_REPO_BRANCH: ${{ vars.DATA_REPO_BRANCH || 'main' }}
-      DATA_REPO_PUSH_TOKEN: ${{ secrets.DATA_REPO_PUSH_TOKEN }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -35,5 +31,5 @@ jobs:
       - name: Sync dependencies
         run: uv sync --locked
 
-      - name: Run archiver
-        run: uv run archive.py archive
+      - name: Publish site only
+        run: uv run archive.py site

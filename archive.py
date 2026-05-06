@@ -525,9 +525,7 @@ def process_package(archiver, package_info):
         return {"name": name, "status": "failed", "reason": str(e)}
 
 
-def main():
-    update_github_pages_branch()
-
+def run_archive():
     with GitRepoStore() as store:
         archiver = Archiver(store)
 
@@ -562,6 +560,19 @@ def main():
             failed_count,
             skipped_count,
         )
+
+
+def main():
+    command = sys.argv[1] if len(sys.argv) > 1 else "archive"
+
+    if command == "site":
+        update_github_pages_branch()
+        return
+
+    if command not in {"archive", "run"}:
+        raise SystemExit(f"Unknown subcommand: {command}")
+
+    run_archive()
 
 
 if __name__ == "__main__":

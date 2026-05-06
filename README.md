@@ -32,7 +32,7 @@ uv run archive.py
 ## Run Periodically
 
 ```bash
-uv run archive.py
+uv run archive.py archive
 ```
 
 ## Use A Local Packages File
@@ -50,7 +50,12 @@ uv run python -m http.server 8000
 ```
 
 GitHub Pages publishing is handled directly by
-[`archive.py`](/mnt/MKSpace/Dev/NimArchive/archive.py) before archive processing runs.
+[`archive.py site`](/mnt/MKSpace/Dev/NimArchive/archive.py) as a separate fast subcommand.
+
+## Commands
+
+- `uv run archive.py archive`: run the package archiver
+- `uv run archive.py site`: publish the static site only
 
 ## Data Repo
 
