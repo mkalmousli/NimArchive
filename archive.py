@@ -15,7 +15,6 @@ import tempfile
 import threading
 import time
 import urllib.request
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
 
 logging.basicConfig(
@@ -500,16 +499,6 @@ class Archiver:
             if os.path.exists(temp_export):
                 shutil.rmtree(temp_export)
         return False
-
-
-def get_worker_count(task_count):
-    workers_raw = os.environ.get("ARCHIVER_WORKERS", "").strip()
-    if workers_raw:
-        return max(1, min(task_count, int(workers_raw)))
-    cpu_count = os.cpu_count() or 4
-    return max(1, min(task_count, cpu_count * 4))
-
-
 def process_package(archiver, package_info):
     index, total, pkg = package_info
     name = pkg.get("name")
@@ -555,17 +544,11 @@ def main():
             logging.info("No packages selected for processing.")
             return
 
-        worker_count = get_worker_count(len(selected_packages))
-        logging.info("Processing %s packages with %s workers...", len(selected_packages), worker_count)
+        logging.info("Processing %s packages serially...", len(selected_packages))
 
         results = []
-        with ThreadPoolExecutor(max_workers=worker_count) as executor:
-            futures = [
-                executor.submit(process_package, archiver, (i + 1, total, pkg))
-                for i, pkg in enumerate(selected_packages)
-            ]
-            for future in as_completed(futures):
-                results.append(future.result())
+        for i, pkg in enumerate(selected_packages):
+            results.append(process_package(archiver, (i + 1, total, pkg)))
 
         success_count = sum(1 for result in results if result["status"] == "ok")
         failed_count = sum(1 for result in results if result["status"] == "failed")
