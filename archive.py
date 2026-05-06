@@ -250,6 +250,7 @@ class ArchiveOrgUploader:
         self.identifier, self.metadata = build_archive_org_metadata()
         self.session = get_session(config={"s3": {"access": self.access_key, "secret": self.secret_key}})
         self.lock = threading.Lock()
+        self.metadata_lock = threading.Lock()
         self.remote_md5_by_name = {}
         self.remote_json_cache = {}
         self.index = {}
@@ -271,22 +272,23 @@ class ArchiveOrgUploader:
         self.index = self.load_json(REMOTE_INDEX_NAME, {})
 
     def _sync_metadata(self):
-        metadata_response = modify_metadata(
-            self.identifier,
-            metadata=self.metadata,
-            access_key=self.access_key,
-            secret_key=self.secret_key,
-            archive_session=self.session,
-        )
-        if not metadata_response.ok:
-            logging.warning(
-                "Archive.org metadata update failed for %s: %s",
+        with self.metadata_lock:
+            metadata_response = modify_metadata(
                 self.identifier,
-                metadata_response.status_code,
+                metadata=self.metadata,
+                access_key=self.access_key,
+                secret_key=self.secret_key,
+                archive_session=self.session,
             )
-            return False
-        self.metadata_applied = True
-        return True
+            if not metadata_response.ok:
+                logging.warning(
+                    "Archive.org metadata update failed for %s: %s",
+                    self.identifier,
+                    metadata_response.status_code,
+                )
+                return False
+            self.metadata_applied = True
+            return True
 
     def _update_json_cache(self, remote_name, data):
         self.remote_json_cache[remote_name] = copy.deepcopy(data)
@@ -309,7 +311,7 @@ class ArchiveOrgUploader:
     def reserve_package_id(self, name, pkg_type, url, license_name):
         with self.lock:
             if name in self.index:
-                return self.index[name]["id"]
+                return self.index[name]["id"], False
 
             existing_ids = {entry["id"] for entry in self.index.values() if isinstance(entry, dict) and "id" in entry}
             proposed_id = name
@@ -326,7 +328,55 @@ class ArchiveOrgUploader:
                 "added_at": int(time.time()),
             }
             self._update_json_cache(REMOTE_INDEX_NAME, self.index)
-            return proposed_id
+            return proposed_id, True
+
+    def _upload_files(self, changed_items):
+        with ExitStack() as stack:
+            upload_files = {
+                remote_name: stack.enter_context(open(local_path, "rb"))
+                for remote_name, local_path, _ in changed_items
+            }
+            return upload(
+                self.identifier,
+                upload_files,
+                metadata=None if self.metadata_applied else self.metadata,
+                access_key=self.access_key,
+                secret_key=self.secret_key,
+                checksum=True,
+                verify=True,
+                retries=5,
+                retries_sleep=10,
+                verbose=True,
+                archive_session=self.session,
+            )
+
+    def _mark_uploaded_files(self, changed_items):
+        with self.lock:
+            for remote_name, local_path, file_md5 in changed_items:
+                self.remote_md5_by_name[remote_name] = file_md5
+                if remote_name.endswith(".json"):
+                    with open(local_path, "r", encoding="utf-8") as f:
+                        self._update_json_cache(remote_name, json.load(f))
+                    if remote_name == REMOTE_INDEX_NAME:
+                        self.index = copy.deepcopy(self.remote_json_cache[remote_name])
+            self.metadata_applied = True
+
+    def upload_index_snapshot(self):
+        with tempfile.TemporaryDirectory(prefix="archive_index_") as temp_dir:
+            index_path = os.path.join(temp_dir, REMOTE_INDEX_NAME)
+            save_json(index_path, self.get_index_snapshot())
+            changed_items = [(REMOTE_INDEX_NAME, index_path, calculate_md5(index_path))]
+            with self.lock:
+                if self.remote_md5_by_name.get(REMOTE_INDEX_NAME) == changed_items[0][2]:
+                    return False
+            responses = self._upload_files(changed_items)
+            failed = [response for response in responses if not response.ok]
+            if failed:
+                raise RuntimeError("Archive.org index.json upload failed")
+            self._mark_uploaded_files(changed_items)
+        self._sync_metadata()
+        logging.info("Uploaded index.json after discovering a new package.")
+        return True
 
     def get_next_id(self, remote_name, key):
         data = self.load_json(remote_name, {key: []})
@@ -353,39 +403,11 @@ class ArchiveOrgUploader:
             if not changed_items:
                 logging.info("Archive.org upload skipped for %s: no changed files.", package_name)
                 return 0
-
-            with ExitStack() as stack:
-                upload_files = {
-                    remote_name: stack.enter_context(open(local_path, "rb"))
-                    for remote_name, local_path, _ in changed_items
-                }
-                responses = upload(
-                    self.identifier,
-                    upload_files,
-                    metadata=None if self.metadata_applied else self.metadata,
-                    access_key=self.access_key,
-                    secret_key=self.secret_key,
-                    checksum=True,
-                    verify=True,
-                    retries=5,
-                    retries_sleep=10,
-                    verbose=True,
-                    archive_session=self.session,
-                )
-
-            failed = [response for response in responses if not response.ok]
-            if failed:
-                raise RuntimeError(f"{len(failed)} Archive.org upload requests failed for {package_name}")
-
-            for remote_name, local_path, file_md5 in changed_items:
-                self.remote_md5_by_name[remote_name] = file_md5
-                if remote_name.endswith(".json"):
-                    with open(local_path, "r", encoding="utf-8") as f:
-                        self._update_json_cache(remote_name, json.load(f))
-                    if remote_name == REMOTE_INDEX_NAME:
-                        self.index = copy.deepcopy(self.remote_json_cache[remote_name])
-            self.metadata_applied = True
-
+        responses = self._upload_files(changed_items)
+        failed = [response for response in responses if not response.ok]
+        if failed:
+            raise RuntimeError(f"{len(failed)} Archive.org upload requests failed for {package_name}")
+        self._mark_uploaded_files(changed_items)
         self._sync_metadata()
 
         logging.info("Uploaded package %s to Archive.org (%s files).", package_name, len(changed_items))
@@ -396,7 +418,9 @@ class Archiver:
         self.uploader = uploader
 
     def archive_git_repo(self, name, url, license_name):
-        pkg_id = self.uploader.reserve_package_id(name, "git", url, license_name)
+        pkg_id, is_new_package = self.uploader.reserve_package_id(name, "git", url, license_name)
+        if is_new_package:
+            self.uploader.upload_index_snapshot()
 
         with tempfile.TemporaryDirectory(prefix=f"archiver_{name}_") as temp_dir:
             repo_path = os.path.join(temp_dir, "repo")
@@ -412,7 +436,6 @@ class Archiver:
 
             self._process_branch(repo_path, pkg_id, package_root, "HEAD", temp_dir)
             self._process_tags(repo_path, pkg_id, package_root, temp_dir)
-            save_json(os.path.join(upload_root, REMOTE_INDEX_NAME), self.uploader.get_index_snapshot())
             uploaded_files = self.uploader.upload_tree(upload_root, name)
             logging.info("Package %s finished upload; cleaned temporary files after %s uploaded file(s).", name, uploaded_files)
         return True
