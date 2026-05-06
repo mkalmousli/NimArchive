@@ -253,8 +253,9 @@ class ArchiveOrgUploader:
         self.remote_md5_by_name = {}
         self.remote_json_cache = {}
         self.index = {}
+        self.metadata_applied = False
         self._load_remote_state()
-        self._sync_metadata()
+        self.metadata_applied = bool(self.remote_md5_by_name)
 
     def _load_remote_state(self):
         logging.info("Fetching current Archive.org file state for %s...", self.identifier)
@@ -278,7 +279,14 @@ class ArchiveOrgUploader:
             archive_session=self.session,
         )
         if not metadata_response.ok:
-            raise RuntimeError(f"Archive.org metadata update failed: {metadata_response.status_code}")
+            logging.warning(
+                "Archive.org metadata update failed for %s: %s",
+                self.identifier,
+                metadata_response.status_code,
+            )
+            return False
+        self.metadata_applied = True
+        return True
 
     def _update_json_cache(self, remote_name, data):
         self.remote_json_cache[remote_name] = copy.deepcopy(data)
@@ -354,7 +362,7 @@ class ArchiveOrgUploader:
                 responses = upload(
                     self.identifier,
                     upload_files,
-                    metadata=None,
+                    metadata=None if self.metadata_applied else self.metadata,
                     access_key=self.access_key,
                     secret_key=self.secret_key,
                     checksum=True,
@@ -376,6 +384,9 @@ class ArchiveOrgUploader:
                         self._update_json_cache(remote_name, json.load(f))
                     if remote_name == REMOTE_INDEX_NAME:
                         self.index = copy.deepcopy(self.remote_json_cache[remote_name])
+            self.metadata_applied = True
+
+        self._sync_metadata()
 
         logging.info("Uploaded package %s to Archive.org (%s files).", package_name, len(changed_items))
         return len(changed_items)
