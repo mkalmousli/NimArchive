@@ -21,6 +21,7 @@ site/
 
 The archiver entrypoint is [`archive.py`](/mnt/MKSpace/Dev/NimArchive/archive.py).
 The browser UI lives in [`site/`](/mnt/MKSpace/Dev/NimArchive/site).
+Package snapshots are uploaded directly to Archive.org as each package finishes processing; they are not stored in the repository as a local archive tree.
 
 ## Run Once
 

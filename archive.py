@@ -11,6 +11,9 @@ import subprocess
 import json
 import logging
 import sys
+import copy
+import urllib.error
+import urllib.parse
 import urllib.request
 import hashlib
 import tarfile
@@ -38,10 +41,9 @@ logging.basicConfig(
 
 PACKAGES_URL = "https://raw.githubusercontent.com/nim-lang/packages/master/packages.json"
 BASE_DIR = os.getcwd()
-ARCHIVE_ROOT = os.path.join(BASE_DIR, "archive")
-PACKAGES_DIR = os.path.join(ARCHIVE_ROOT, "packages")
-SYNC_BATCH_SIZE = 128
 DEFAULT_GITHUB_PAGES_BRANCH = "gh-pages"
+REMOTE_INDEX_NAME = "index.json"
+REMOTE_PACKAGES_DIR = "packages"
 
 def ensure_dir(directory):
     if not os.path.exists(directory):
@@ -131,8 +133,19 @@ def collect_archive_files(root_path):
             files[relative_path] = path
     return files
 
-def chunk_items(items, size):
-    return [items[index:index + size] for index in range(0, len(items), size)]
+def load_public_archive_org_json(identifier, remote_name, default=None):
+    quoted_path = "/".join(urllib.parse.quote(part) for part in remote_name.split("/"))
+    url = f"https://archive.org/download/{identifier}/{quoted_path}"
+    try:
+        with urllib.request.urlopen(url) as response:
+            return json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            return copy.deepcopy(default) if default is not None else {}
+        raise
+    except Exception as e:
+        logging.warning("Could not load remote JSON %s: %s", remote_name, e)
+        return copy.deepcopy(default) if default is not None else {}
 
 def copy_tree(src, dst):
     ensure_dir(dst)
@@ -227,125 +240,158 @@ def update_github_pages_branch():
         if os.path.exists(worktree_dir):
             shutil.rmtree(worktree_dir, ignore_errors=True)
 
-def should_sync_archive_org():
-    required = ("ARCHIVE_ORG_IDENTIFIER", "ARCHIVE_ORG_ACCESS_KEY", "ARCHIVE_ORG_SECRET_KEY")
-    return all(os.environ.get(name, "").strip() for name in required)
-
-def sync_archive_org(archive_root):
-    if not should_sync_archive_org():
-        logging.info("Archive.org sync skipped: missing credentials or identifier.")
-        return
-    if upload is None or get_session is None or get_files is None or modify_metadata is None:
-        raise RuntimeError("internetarchive is not installed; cannot sync to Archive.org")
-    if not os.path.exists(archive_root):
-        raise RuntimeError(f"Archive root does not exist: {archive_root}")
-
-    access_key = require_env("ARCHIVE_ORG_ACCESS_KEY")
-    secret_key = require_env("ARCHIVE_ORG_SECRET_KEY")
-    identifier, metadata = build_archive_org_metadata()
-    local_files = collect_archive_files(archive_root)
-    if not local_files:
-        logging.info("Archive.org sync skipped: no archive files found.")
-        return
-
-    session = get_session(config={"s3": {"access": access_key, "secret": secret_key}})
-    logging.info("Fetching current Archive.org file state for %s...", identifier)
-    remote_md5_by_name = {}
-    try:
-        for remote_file in get_files(identifier, archive_session=session):
-            name = getattr(remote_file, "name", None)
-            if not name:
-                continue
-            remote_md5_by_name[name] = getattr(remote_file, "md5", None)
-    except Exception as e:
-        logging.warning("Could not read current Archive.org file list for %s: %s", identifier, e)
-
-    changed_items = []
-    for remote_name, local_path in local_files.items():
-        local_md5 = calculate_md5(local_path)
-        if remote_md5_by_name.get(remote_name) != local_md5:
-            changed_items.append((remote_name, local_path))
-
-    if not changed_items:
-        logging.info("Archive.org sync: no changed files to upload.")
-    else:
-        logging.info("Archive.org sync: uploading %s changed files...", len(changed_items))
-        responses = []
-        for index, batch in enumerate(chunk_items(changed_items, SYNC_BATCH_SIZE)):
-            with ExitStack() as stack:
-                upload_files = {
-                    remote_name: stack.enter_context(open(local_path, "rb"))
-                    for remote_name, local_path in batch
-                }
-                batch_responses = upload(
-                    identifier,
-                    upload_files,
-                    metadata=metadata if index == 0 and not remote_md5_by_name else None,
-                    access_key=access_key,
-                    secret_key=secret_key,
-                    checksum=True,
-                    verify=True,
-                    retries=5,
-                    retries_sleep=10,
-                    verbose=True,
-                    archive_session=session,
-                )
-                responses.extend(batch_responses)
-
-        failed = [response for response in responses if not response.ok]
-        if failed:
-            raise RuntimeError(f"{len(failed)} Archive.org upload requests failed")
-
-    metadata_response = modify_metadata(
-        identifier,
-        metadata=metadata,
-        access_key=access_key,
-        secret_key=secret_key,
-        archive_session=session,
-    )
-    if not metadata_response.ok:
-        raise RuntimeError(f"Archive.org metadata update failed: {metadata_response.status_code}")
-    logging.info("Archive.org sync completed for %s.", identifier)
-
-class Archiver:
+class ArchiveOrgUploader:
     def __init__(self):
-        ensure_dir(ARCHIVE_ROOT)
-        ensure_dir(PACKAGES_DIR)
-        self.index_path = os.path.join(ARCHIVE_ROOT, "index.json")
-        self.index = get_json(self.index_path, {})
-        self.index_lock = threading.Lock()
+        if upload is None or get_session is None or get_files is None or modify_metadata is None:
+            raise RuntimeError("internetarchive is not installed; cannot upload to Archive.org")
 
-    def get_package_id(self, name, pkg_type, url, license_name):
-        with self.index_lock:
+        self.access_key = require_env("ARCHIVE_ORG_ACCESS_KEY")
+        self.secret_key = require_env("ARCHIVE_ORG_SECRET_KEY")
+        self.identifier, self.metadata = build_archive_org_metadata()
+        self.session = get_session(config={"s3": {"access": self.access_key, "secret": self.secret_key}})
+        self.lock = threading.Lock()
+        self.remote_md5_by_name = {}
+        self.remote_json_cache = {}
+        self.index = {}
+        self._load_remote_state()
+        self._sync_metadata()
+
+    def _load_remote_state(self):
+        logging.info("Fetching current Archive.org file state for %s...", self.identifier)
+        try:
+            for remote_file in get_files(self.identifier, archive_session=self.session):
+                name = getattr(remote_file, "name", None)
+                if not name:
+                    continue
+                self.remote_md5_by_name[name] = getattr(remote_file, "md5", None)
+        except Exception as e:
+            logging.warning("Could not read current Archive.org file list for %s: %s", self.identifier, e)
+
+        self.index = self.load_json(REMOTE_INDEX_NAME, {})
+
+    def _sync_metadata(self):
+        metadata_response = modify_metadata(
+            self.identifier,
+            metadata=self.metadata,
+            access_key=self.access_key,
+            secret_key=self.secret_key,
+            archive_session=self.session,
+        )
+        if not metadata_response.ok:
+            raise RuntimeError(f"Archive.org metadata update failed: {metadata_response.status_code}")
+
+    def _update_json_cache(self, remote_name, data):
+        self.remote_json_cache[remote_name] = copy.deepcopy(data)
+
+    def load_json(self, remote_name, default=None):
+        with self.lock:
+            if remote_name in self.remote_json_cache:
+                return copy.deepcopy(self.remote_json_cache[remote_name])
+
+        data = load_public_archive_org_json(self.identifier, remote_name, default)
+        with self.lock:
+            if remote_name not in self.remote_json_cache:
+                self._update_json_cache(remote_name, data)
+            return copy.deepcopy(self.remote_json_cache[remote_name])
+
+    def get_index_snapshot(self):
+        with self.lock:
+            return copy.deepcopy(self.index)
+
+    def reserve_package_id(self, name, pkg_type, url, license_name):
+        with self.lock:
             if name in self.index:
                 return self.index[name]["id"]
-            
-            existing_ids = {p["id"] for p in self.index.values() if "id" in p}
-            
+
+            existing_ids = {entry["id"] for entry in self.index.values() if isinstance(entry, dict) and "id" in entry}
             proposed_id = name
             counter = 1
             while proposed_id in existing_ids:
                 proposed_id = f"{name}{counter}"
                 counter += 1
-            
+
             self.index[name] = {
                 "id": proposed_id,
                 "type": pkg_type,
                 "url": url,
                 "license": license_name,
-                "added_at": int(time.time())
+                "added_at": int(time.time()),
             }
-            save_json(self.index_path, self.index)
+            self._update_json_cache(REMOTE_INDEX_NAME, self.index)
             return proposed_id
 
+    def get_next_id(self, remote_name, key):
+        data = self.load_json(remote_name, {key: []})
+        numeric_ids = [int(value) for value in data.get(key, []) if str(value).isdigit()]
+        return str(max(numeric_ids) + 1) if numeric_ids else "0"
+
+    def upload_tree(self, root_path, package_name):
+        local_files = collect_archive_files(root_path)
+        if not local_files:
+            logging.info("Archive.org upload skipped for %s: no files generated.", package_name)
+            return 0
+
+        file_items = []
+        for remote_name, local_path in local_files.items():
+            file_items.append((remote_name, local_path, calculate_md5(local_path)))
+
+        with self.lock:
+            changed_items = [
+                (remote_name, local_path, file_md5)
+                for remote_name, local_path, file_md5 in file_items
+                if self.remote_md5_by_name.get(remote_name) != file_md5
+            ]
+
+            if not changed_items:
+                logging.info("Archive.org upload skipped for %s: no changed files.", package_name)
+                return 0
+
+            with ExitStack() as stack:
+                upload_files = {
+                    remote_name: stack.enter_context(open(local_path, "rb"))
+                    for remote_name, local_path, _ in changed_items
+                }
+                responses = upload(
+                    self.identifier,
+                    upload_files,
+                    metadata=None,
+                    access_key=self.access_key,
+                    secret_key=self.secret_key,
+                    checksum=True,
+                    verify=True,
+                    retries=5,
+                    retries_sleep=10,
+                    verbose=True,
+                    archive_session=self.session,
+                )
+
+            failed = [response for response in responses if not response.ok]
+            if failed:
+                raise RuntimeError(f"{len(failed)} Archive.org upload requests failed for {package_name}")
+
+            for remote_name, local_path, file_md5 in changed_items:
+                self.remote_md5_by_name[remote_name] = file_md5
+                if remote_name.endswith(".json"):
+                    with open(local_path, "r", encoding="utf-8") as f:
+                        self._update_json_cache(remote_name, json.load(f))
+                    if remote_name == REMOTE_INDEX_NAME:
+                        self.index = copy.deepcopy(self.remote_json_cache[remote_name])
+
+        logging.info("Uploaded package %s to Archive.org (%s files).", package_name, len(changed_items))
+        return len(changed_items)
+
+class Archiver:
+    def __init__(self, uploader):
+        self.uploader = uploader
+
     def archive_git_repo(self, name, url, license_name):
-        pkg_id = self.get_package_id(name, "git", url, license_name)
-        pkg_base_dir = os.path.join(PACKAGES_DIR, pkg_id)
-        
+        pkg_id = self.uploader.reserve_package_id(name, "git", url, license_name)
+
         with tempfile.TemporaryDirectory(prefix=f"archiver_{name}_") as temp_dir:
             repo_path = os.path.join(temp_dir, "repo")
-            
-            # 1. Sync Repo (Clone into temp)
+            upload_root = os.path.join(temp_dir, "upload")
+            package_root = os.path.join(upload_root, REMOTE_PACKAGES_DIR, pkg_id)
+
             logging.info(f"Cloning {name}...")
             try:
                 subprocess.run(['git', 'clone', '--mirror', url, repo_path], check=True, capture_output=True)
@@ -353,51 +399,51 @@ class Archiver:
                 logging.error(f"Clone failed for {name}: {e.stderr.decode()}")
                 return False
 
-            # 2. Process HEAD (code/)
-            self._process_branch(repo_path, pkg_base_dir, "HEAD", temp_dir)
-
-            # 3. Process Tags (versions/)
-            self._process_tags(repo_path, pkg_base_dir, temp_dir)
+            self._process_branch(repo_path, pkg_id, package_root, "HEAD", temp_dir)
+            self._process_tags(repo_path, pkg_id, package_root, temp_dir)
+            save_json(os.path.join(upload_root, REMOTE_INDEX_NAME), self.uploader.get_index_snapshot())
+            uploaded_files = self.uploader.upload_tree(upload_root, name)
+            logging.info("Package %s finished upload; cleaned temporary files after %s uploaded file(s).", name, uploaded_files)
         return True
 
-    def _process_branch(self, repo_path, pkg_base_dir, branch, temp_dir):
-        code_dir = os.path.join(pkg_base_dir, "code")
-        ensure_dir(code_dir)
-        
+    def _process_branch(self, repo_path, pkg_id, package_root, branch, temp_dir):
+        code_dir = os.path.join(package_root, "code")
+        remote_code_dir = f"{REMOTE_PACKAGES_DIR}/{pkg_id}/code"
+
         try:
             commit = subprocess.run(['git', '-C', repo_path, 'rev-parse', branch], 
                                    capture_output=True, text=True, check=True).stdout.strip()
         except subprocess.CalledProcessError:
-            return
+            return False
 
-        latest_json_path = os.path.join(code_dir, "latest.json")
-        all_json_path = os.path.join(code_dir, "all.json")
-        
-        latest_data = get_json(latest_json_path)
+        latest_data = self.uploader.load_json(f"{remote_code_dir}/latest.json", {})
         latest_code_id = latest_data.get("code")
-        
+
         should_archive = True
         if latest_code_id:
-            meta = get_json(os.path.join(code_dir, latest_code_id, "metadata.json"))
+            meta = self.uploader.load_json(f"{remote_code_dir}/{latest_code_id}/metadata.json", {})
             if meta.get("commit") == commit:
                 should_archive = False
 
-        if should_archive:
-            new_code_id = get_next_id(code_dir)
-            logging.info(f"Archiving new code state for {branch} (ID: {new_code_id})")
-            self._do_archive(repo_path, os.path.join(code_dir, new_code_id), commit, temp_dir)
-            
-            # Update latest/all
-            save_json(latest_json_path, {"code": new_code_id})
-            all_data = get_json(all_json_path, {"codes": []})
-            if new_code_id not in all_data["codes"]:
-                all_data["codes"].append(new_code_id)
-            save_json(all_json_path, all_data)
+        if not should_archive:
+            return False
 
-    def _process_tags(self, repo_path, pkg_base_dir, temp_dir):
-        versions_dir = os.path.join(pkg_base_dir, "versions")
-        ensure_dir(versions_dir)
-        
+        new_code_id = self.uploader.get_next_id(f"{remote_code_dir}/all.json", "codes")
+        logging.info(f"Archiving new code state for {branch} (ID: {new_code_id})")
+        if not self._do_archive(repo_path, os.path.join(code_dir, new_code_id), commit, temp_dir):
+            return False
+
+        save_json(os.path.join(code_dir, "latest.json"), {"code": new_code_id})
+        all_data = self.uploader.load_json(f"{remote_code_dir}/all.json", {"codes": []})
+        if new_code_id not in all_data["codes"]:
+            all_data["codes"].append(new_code_id)
+        save_json(os.path.join(code_dir, "all.json"), all_data)
+        return True
+
+    def _process_tags(self, repo_path, pkg_id, package_root, temp_dir):
+        versions_dir = os.path.join(package_root, "versions")
+        remote_versions_dir = f"{REMOTE_PACKAGES_DIR}/{pkg_id}/versions"
+
         try:
             tags_output = subprocess.run(['git', '-C', repo_path, 'tag'], 
                                         capture_output=True, text=True, check=True).stdout.strip()
@@ -405,54 +451,48 @@ class Archiver:
         except subprocess.CalledProcessError:
             tags = []
 
-        v_all_json_path = os.path.join(versions_dir, "all.json")
-        v_latest_json_path = os.path.join(versions_dir, "latest.json")
-        
-        existing_versions = get_json(v_all_json_path, {"versions": []})
-        
+        existing_versions = self.uploader.load_json(f"{remote_versions_dir}/all.json", {"versions": []})
         latest_tag = None
         for tag in tags:
-            if not tag: continue
+            if not tag:
+                continue
             latest_tag = tag
-            
             tag_dir = os.path.join(versions_dir, tag)
-            ensure_dir(tag_dir)
-            
+            remote_tag_dir = f"{remote_versions_dir}/{tag}"
+
             try:
                 commit = subprocess.run(['git', '-C', repo_path, 'rev-parse', f"{tag}^{{commit}}"], 
                                        capture_output=True, text=True, check=True).stdout.strip()
             except subprocess.CalledProcessError:
                 continue
 
-            t_latest_json_path = os.path.join(tag_dir, "latest.json")
-            t_all_json_path = os.path.join(tag_dir, "all.json")
-            
-            t_latest_data = get_json(t_latest_json_path)
+            t_latest_data = self.uploader.load_json(f"{remote_tag_dir}/latest.json", {})
             t_latest_id = t_latest_data.get("version_id")
-            
+
             should_archive = True
             if t_latest_id:
-                meta = get_json(os.path.join(tag_dir, t_latest_id, "metadata.json"))
+                meta = self.uploader.load_json(f"{remote_tag_dir}/{t_latest_id}/metadata.json", {})
                 if meta.get("commit") == commit:
                     should_archive = False
-            
+
             if should_archive:
-                new_v_id = get_next_id(tag_dir)
+                new_v_id = self.uploader.get_next_id(f"{remote_tag_dir}/all.json", "versions")
                 logging.info(f"Archiving tag {tag} (ID: {new_v_id})")
-                self._do_archive(repo_path, os.path.join(tag_dir, new_v_id), commit, temp_dir)
-                
-                save_json(t_latest_json_path, {"version_id": new_v_id})
-                t_all_data = get_json(t_all_json_path, {"versions": []})
+                if not self._do_archive(repo_path, os.path.join(tag_dir, new_v_id), commit, temp_dir):
+                    continue
+
+                save_json(os.path.join(tag_dir, "latest.json"), {"version_id": new_v_id})
+                t_all_data = self.uploader.load_json(f"{remote_tag_dir}/all.json", {"versions": []})
                 if new_v_id not in t_all_data["versions"]:
                     t_all_data["versions"].append(new_v_id)
-                save_json(t_all_json_path, t_all_data)
+                save_json(os.path.join(tag_dir, "all.json"), t_all_data)
 
             if tag not in existing_versions["versions"]:
                 existing_versions["versions"].append(tag)
 
-        save_json(v_all_json_path, existing_versions)
+        save_json(os.path.join(versions_dir, "all.json"), existing_versions)
         if latest_tag:
-            save_json(v_latest_json_path, {"version": latest_tag})
+            save_json(os.path.join(versions_dir, "latest.json"), {"version": latest_tag})
 
     def _do_archive(self, repo_path, target_dir, commit, temp_dir):
         ensure_dir(target_dir)
@@ -493,9 +533,11 @@ class Archiver:
                 if license_file:
                     metadata["license"] = "LICENSE.md"
                 save_json(os.path.join(target_dir, "metadata.json"), metadata)
+                return True
         finally:
             if os.path.exists(temp_export):
                 shutil.rmtree(temp_export)
+        return False
 
 def get_worker_count(task_count):
     workers_raw = os.environ.get("ARCHIVER_WORKERS", "").strip()
@@ -528,7 +570,8 @@ def process_package(archiver, package_info):
 
 def main():
     update_github_pages_branch()
-    archiver = Archiver()
+    uploader = ArchiveOrgUploader()
+    archiver = Archiver(uploader)
     
     logging.info(f"Fetching package list from {PACKAGES_URL}...")
     try:
@@ -567,7 +610,6 @@ def main():
         failed_count,
         skipped_count,
     )
-    sync_archive_org(ARCHIVE_ROOT)
 
 if __name__ == '__main__':
     main()
