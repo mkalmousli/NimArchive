@@ -218,6 +218,21 @@ async function renderPackageDetail(name) {
 
         const versionSelect = createSelect("VERSION");
         const versionIdSelect = createSelect("ARCHIVE");
+        const downloadWrap = create("div", selectorContainer, { display: "flex", flexDirection: "column", gap: "4px", fontSize: "10px", color: theme.dim });
+        downloadWrap.textContent = "DOWNLOAD";
+        const selectedDownloadLink = create("a", downloadWrap, {
+            minWidth: "140px",
+            padding: "6px 8px",
+            border: `1px solid ${CONFIG.primary}`,
+            borderRadius: "4px",
+            backgroundColor: "transparent",
+            color: CONFIG.primary,
+            fontSize: "11px",
+            fontWeight: "600",
+            textDecoration: "none",
+            textAlign: "center"
+        });
+        selectedDownloadLink.textContent = "DOWNLOAD TAR.GZ";
         const versionIdCache = new Map();
         const documentCache = new Map();
         const versionLabelCache = new Map();
@@ -236,6 +251,19 @@ async function renderPackageDetail(name) {
         let selectedVersionId = "latest";
         let selectedMeta = latestMeta;
         let selectedPath = latestPath;
+
+        const updateSelectedDownloadLink = () => {
+        if (!selectedPath) {
+            selectedDownloadLink.removeAttribute("href");
+            selectedDownloadLink.setAttribute("aria-disabled", "true");
+            s(selectedDownloadLink, { opacity: "0.5", pointerEvents: "none" });
+            return;
+        }
+        selectedDownloadLink.href = `${selectedPath}/source.tar.gz`;
+        selectedDownloadLink.target = "_blank";
+        selectedDownloadLink.removeAttribute("aria-disabled");
+        s(selectedDownloadLink, { opacity: "1", pointerEvents: "auto" });
+        };
 
         const getAvailableTabs = () => {
         const tabs = [];
@@ -302,6 +330,7 @@ async function renderPackageDetail(name) {
             const cached = documentCache.get(cacheKey);
             selectedMeta = cached.meta;
             selectedPath = cached.path;
+            updateSelectedDownloadLink();
             return;
         }
 
@@ -318,6 +347,7 @@ async function renderPackageDetail(name) {
             selectedPath = path;
         }
         documentCache.set(cacheKey, { meta: selectedMeta, path: selectedPath });
+        updateSelectedDownloadLink();
         };
 
         const renderTabs = () => {
@@ -398,6 +428,7 @@ async function renderPackageDetail(name) {
 
         versionIdSelect.disabled = true;
         setVersionIdOptions([{ id: "latest", label: "Latest" }], "latest");
+        updateSelectedDownloadLink();
         await refreshSelectedDocument(`Loading ${name}...`);
     });
 }
