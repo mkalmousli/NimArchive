@@ -7,6 +7,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -89,6 +90,11 @@ def collect_archive_files(root_path):
             relative_path = os.path.relpath(path, root_path).replace(os.sep, "/")
             files[relative_path] = path
     return files
+
+
+def sanitize_name_part(value):
+    cleaned = re.sub(r"[^A-Za-z0-9._-]+", "-", value).strip("-._")
+    return cleaned or "archive"
 
 
 def copy_tree(src, dst):
@@ -303,7 +309,7 @@ class GitRepoStore:
 
         required_files = [
             f"{remote_snapshot_dir}/metadata.json",
-            f"{remote_snapshot_dir}/source.tar.gz",
+            f"{remote_snapshot_dir}/{metadata.get('archive_name', 'source.tar.gz')}",
         ]
         if metadata.get("readme"):
             required_files.append(f"{remote_snapshot_dir}/{metadata['readme']}")
@@ -379,13 +385,13 @@ class Archiver:
                 logging.error("Clone failed for %s: %s", name, e.stderr.decode())
                 return False
 
-            self._process_branch(repo_path, pkg_id, package_root, "HEAD", temp_dir)
-            self._process_tags(repo_path, pkg_id, package_root, temp_dir)
+            self._process_branch(repo_path, name, pkg_id, package_root, "HEAD", temp_dir)
+            self._process_tags(repo_path, name, pkg_id, package_root, temp_dir)
             saved_files = self.store.upload_tree(upload_root, name)
             logging.info("Package %s synced into data repo after %s changed file(s).", name, saved_files)
         return True
 
-    def _process_branch(self, repo_path, pkg_id, package_root, branch, temp_dir):
+    def _process_branch(self, repo_path, package_name, pkg_id, package_root, branch, temp_dir):
         code_dir = os.path.join(package_root, "code")
         remote_code_dir = f"{REMOTE_PACKAGES_DIR}/{pkg_id}/code"
         ensure_dir(code_dir)
@@ -399,10 +405,11 @@ class Archiver:
         latest_code_id = latest_data.get("code")
         code_id, needs_archive = self._select_snapshot_id(remote_code_dir, "codes", latest_code_id, commit)
         target_dir = os.path.join(code_dir, code_id)
+        archive_label = "latest"
 
         if needs_archive:
             logging.info("Archiving code state for %s (ID: %s)", branch, code_id)
-            if not self._do_archive(repo_path, target_dir, commit, temp_dir):
+            if not self._do_archive(repo_path, package_name, archive_label, target_dir, commit, temp_dir):
                 return False
 
         save_json(os.path.join(code_dir, "latest.json"), {"code": code_id})
@@ -412,7 +419,7 @@ class Archiver:
         save_json(os.path.join(code_dir, "all.json"), all_data)
         return needs_archive
 
-    def _process_tags(self, repo_path, pkg_id, package_root, temp_dir):
+    def _process_tags(self, repo_path, package_name, pkg_id, package_root, temp_dir):
         versions_dir = os.path.join(package_root, "versions")
         remote_versions_dir = f"{REMOTE_PACKAGES_DIR}/{pkg_id}/versions"
         ensure_dir(versions_dir)
@@ -444,7 +451,7 @@ class Archiver:
             version_id, needs_archive = self._select_snapshot_id(remote_tag_dir, "versions", t_latest_id, commit)
             if needs_archive:
                 logging.info("Archiving tag %s (ID: %s)", tag, version_id)
-                if not self._do_archive(repo_path, os.path.join(tag_dir, version_id), commit, temp_dir):
+                if not self._do_archive(repo_path, package_name, tag, os.path.join(tag_dir, version_id), commit, temp_dir):
                     continue
 
             save_json(os.path.join(tag_dir, "latest.json"), {"version_id": version_id})
@@ -460,9 +467,10 @@ class Archiver:
         if latest_tag:
             save_json(os.path.join(versions_dir, "latest.json"), {"version": latest_tag})
 
-    def _do_archive(self, repo_path, target_dir, commit, temp_dir):
+    def _do_archive(self, repo_path, package_name, archive_label, target_dir, commit, temp_dir):
         ensure_dir(target_dir)
-        archive_file = os.path.join(target_dir, "source.tar.gz")
+        archive_name = f"{sanitize_name_part(package_name)}-{sanitize_name_part(archive_label)}.tar.gz"
+        archive_file = os.path.join(target_dir, archive_name)
         temp_export = os.path.join(temp_dir, f"export_{hashlib.md5(target_dir.encode()).hexdigest()}")
 
         try:
@@ -491,6 +499,7 @@ class Archiver:
                     "checksum": calculate_file_hash(archive_file),
                     "commit": commit,
                     "archived_at": int(time.time()),
+                    "archive_name": archive_name,
                 }
                 if readme_file:
                     metadata["readme"] = "README.md"

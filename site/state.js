@@ -1,5 +1,5 @@
 const CONFIG = {
-    archiveBaseUrl: "https://cdn.jsdelivr.net/gh/mkalmousli/NimArchiveData@main",
+    archiveBaseUrl: "https://raw.githubusercontent.com/mkalmousli/NimArchiveData/main",
     primary: "#3b82f6",
     light: {
         bg: "#ffffff",
@@ -51,7 +51,8 @@ function addHover(el, normalStyles, hoverStyles) {
 }
 
 async function fetchArchiveText(path) {
-    const response = await fetch(`${CONFIG.archiveBaseUrl}/${path}`);
+    const url = `${CONFIG.archiveBaseUrl}/${path}?t=${Date.now()}`;
+    const response = await fetch(url, { cache: "no-store" });
     if (!response.ok) {
         throw new Error(`Archive fetch failed: ${response.status}`);
     }

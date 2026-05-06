@@ -259,7 +259,8 @@ async function renderPackageDetail(name) {
             s(selectedDownloadLink, { opacity: "0.5", pointerEvents: "none" });
             return;
         }
-        selectedDownloadLink.href = `${selectedPath}/source.tar.gz`;
+        const archiveName = selectedMeta?.archive_name || "source.tar.gz";
+        selectedDownloadLink.href = `${selectedPath}/${archiveName}`;
         selectedDownloadLink.target = "_blank";
         selectedDownloadLink.removeAttribute("aria-disabled");
         s(selectedDownloadLink, { opacity: "1", pointerEvents: "auto" });
@@ -449,7 +450,7 @@ async function renderHistoryItem(container, basePath, isCompact = false) {
             addHover(btn, { color: theme.dim }, { color: theme.fg, borderColor: theme.fg });
         }
         const dl = create("a", right, { padding: "2px 8px", color: CONFIG.primary, border: `1px solid ${CONFIG.primary}`, borderRadius: "3px", textDecoration: "none", fontWeight: "600", fontSize: "9px" });
-        dl.href = `${basePath}/source.tar.gz`; dl.textContent = "DOWNLOAD";
+        dl.href = `${basePath}/${meta.archive_name || "source.tar.gz"}`; dl.textContent = "DOWNLOAD";
         addHover(dl, { background: "transparent", color: CONFIG.primary }, { background: CONFIG.primary, color: "#fff" });
     } catch(e) {}
 }
