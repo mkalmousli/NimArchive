@@ -2,9 +2,7 @@ name: Site Sync
 
 on:
   workflow_dispatch:
-  issue_comment:
-    types:
-      - created
+  push:
 
 permissions:
   contents: write
