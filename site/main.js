@@ -3,6 +3,7 @@
         try {
             await withLoadingToast("Loading packages...", async () => {
                 state.packages = await fetchArchiveJson("index.json");
+                updatePackageCount();
                 renderPackageList();
                 if (!state.selectedPackage) {
                     const packageNames = Object.keys(state.packages);

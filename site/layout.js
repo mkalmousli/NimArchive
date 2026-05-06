@@ -1,4 +1,4 @@
-let body, root, header, mainContainer, sidebar, contentArea, searchInput, loadingHost, loadingLabel, loadingSubLabel, loadingSpinner, whyOverlay, whyDialog;
+let body, root, header, mainContainer, sidebar, contentArea, searchInput, loadingHost, loadingLabel, loadingSubLabel, loadingSpinner, whyOverlay, whyDialog, packageCountLabel;
 let loadingToastCount = 0;
 
 function initLayout() {
@@ -110,6 +110,12 @@ function initLayout() {
         textOverflow: "ellipsis"
     });
     subtitle.textContent = "Versioned snapshots, READMEs, licenses, and package history.";
+    packageCountLabel = create("div", headerLeft, {
+        fontSize: "10px",
+        opacity: "0.75",
+        marginTop: "2px"
+    });
+    packageCountLabel.textContent = "0 packages archived";
 
     const headerRight = create("div", header, { display: "flex", gap: "8px", alignItems: "center" });
     const byline = create("a", headerRight, {
@@ -228,6 +234,12 @@ function initLayout() {
 
     applyTheme();
     handleResize();
+}
+
+function updatePackageCount() {
+    if (!packageCountLabel) return;
+    const count = Object.keys(state.packages || {}).length;
+    packageCountLabel.textContent = `${count.toLocaleString()} packages archived`;
 }
 
 function applyTheme() {
