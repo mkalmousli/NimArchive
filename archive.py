@@ -383,6 +383,27 @@ class ArchiveOrgUploader:
         numeric_ids = [int(value) for value in data.get(key, []) if str(value).isdigit()]
         return str(max(numeric_ids) + 1) if numeric_ids else "0"
 
+    def remote_file_present(self, remote_name):
+        with self.lock:
+            return remote_name in self.remote_md5_by_name
+
+    def load_snapshot_metadata(self, remote_snapshot_dir):
+        return self.load_json(f"{remote_snapshot_dir}/metadata.json", {})
+
+    def snapshot_is_complete(self, remote_snapshot_dir, metadata):
+        if not metadata:
+            return False
+
+        required_files = [
+            f"{remote_snapshot_dir}/metadata.json",
+            f"{remote_snapshot_dir}/source.tar.gz",
+        ]
+        if metadata.get("readme"):
+            required_files.append(f"{remote_snapshot_dir}/{metadata['readme']}")
+        if metadata.get("license"):
+            required_files.append(f"{remote_snapshot_dir}/{metadata['license']}")
+        return all(self.remote_file_present(path) for path in required_files)
+
     def upload_tree(self, root_path, package_name):
         local_files = collect_archive_files(root_path)
         if not local_files:
@@ -417,6 +438,24 @@ class Archiver:
     def __init__(self, uploader):
         self.uploader = uploader
 
+    def _select_snapshot_id(self, remote_parent_dir, history_key, latest_id, commit):
+        if latest_id:
+            latest_remote_dir = f"{remote_parent_dir}/{latest_id}"
+            latest_meta = self.uploader.load_snapshot_metadata(latest_remote_dir)
+            if latest_meta.get("commit") == commit:
+                return latest_id, not self.uploader.snapshot_is_complete(latest_remote_dir, latest_meta)
+            if not latest_meta:
+                return latest_id, True
+
+        history = self.uploader.load_json(f"{remote_parent_dir}/all.json", {history_key: []})
+        for snapshot_id in history.get(history_key, []):
+            remote_snapshot_dir = f"{remote_parent_dir}/{snapshot_id}"
+            metadata = self.uploader.load_snapshot_metadata(remote_snapshot_dir)
+            if metadata.get("commit") == commit:
+                return snapshot_id, not self.uploader.snapshot_is_complete(remote_snapshot_dir, metadata)
+
+        return self.uploader.get_next_id(f"{remote_parent_dir}/all.json", history_key), True
+
     def archive_git_repo(self, name, url, license_name):
         pkg_id, is_new_package = self.uploader.reserve_package_id(name, "git", url, license_name)
         if is_new_package:
@@ -443,6 +482,7 @@ class Archiver:
     def _process_branch(self, repo_path, pkg_id, package_root, branch, temp_dir):
         code_dir = os.path.join(package_root, "code")
         remote_code_dir = f"{REMOTE_PACKAGES_DIR}/{pkg_id}/code"
+        ensure_dir(code_dir)
 
         try:
             commit = subprocess.run(['git', '-C', repo_path, 'rev-parse', branch], 
@@ -452,31 +492,25 @@ class Archiver:
 
         latest_data = self.uploader.load_json(f"{remote_code_dir}/latest.json", {})
         latest_code_id = latest_data.get("code")
+        code_id, needs_archive = self._select_snapshot_id(remote_code_dir, "codes", latest_code_id, commit)
+        target_dir = os.path.join(code_dir, code_id)
 
-        should_archive = True
-        if latest_code_id:
-            meta = self.uploader.load_json(f"{remote_code_dir}/{latest_code_id}/metadata.json", {})
-            if meta.get("commit") == commit:
-                should_archive = False
+        if needs_archive:
+            logging.info(f"Archiving code state for {branch} (ID: {code_id})")
+            if not self._do_archive(repo_path, target_dir, commit, temp_dir):
+                return False
 
-        if not should_archive:
-            return False
-
-        new_code_id = self.uploader.get_next_id(f"{remote_code_dir}/all.json", "codes")
-        logging.info(f"Archiving new code state for {branch} (ID: {new_code_id})")
-        if not self._do_archive(repo_path, os.path.join(code_dir, new_code_id), commit, temp_dir):
-            return False
-
-        save_json(os.path.join(code_dir, "latest.json"), {"code": new_code_id})
+        save_json(os.path.join(code_dir, "latest.json"), {"code": code_id})
         all_data = self.uploader.load_json(f"{remote_code_dir}/all.json", {"codes": []})
-        if new_code_id not in all_data["codes"]:
-            all_data["codes"].append(new_code_id)
+        if code_id not in all_data["codes"]:
+            all_data["codes"].append(code_id)
         save_json(os.path.join(code_dir, "all.json"), all_data)
-        return True
+        return needs_archive
 
     def _process_tags(self, repo_path, pkg_id, package_root, temp_dir):
         versions_dir = os.path.join(package_root, "versions")
         remote_versions_dir = f"{REMOTE_PACKAGES_DIR}/{pkg_id}/versions"
+        ensure_dir(versions_dir)
 
         try:
             tags_output = subprocess.run(['git', '-C', repo_path, 'tag'], 
@@ -493,6 +527,7 @@ class Archiver:
             latest_tag = tag
             tag_dir = os.path.join(versions_dir, tag)
             remote_tag_dir = f"{remote_versions_dir}/{tag}"
+            ensure_dir(tag_dir)
 
             try:
                 commit = subprocess.run(['git', '-C', repo_path, 'rev-parse', f"{tag}^{{commit}}"], 
@@ -503,23 +538,17 @@ class Archiver:
             t_latest_data = self.uploader.load_json(f"{remote_tag_dir}/latest.json", {})
             t_latest_id = t_latest_data.get("version_id")
 
-            should_archive = True
-            if t_latest_id:
-                meta = self.uploader.load_json(f"{remote_tag_dir}/{t_latest_id}/metadata.json", {})
-                if meta.get("commit") == commit:
-                    should_archive = False
-
-            if should_archive:
-                new_v_id = self.uploader.get_next_id(f"{remote_tag_dir}/all.json", "versions")
-                logging.info(f"Archiving tag {tag} (ID: {new_v_id})")
-                if not self._do_archive(repo_path, os.path.join(tag_dir, new_v_id), commit, temp_dir):
+            version_id, needs_archive = self._select_snapshot_id(remote_tag_dir, "versions", t_latest_id, commit)
+            if needs_archive:
+                logging.info(f"Archiving tag {tag} (ID: {version_id})")
+                if not self._do_archive(repo_path, os.path.join(tag_dir, version_id), commit, temp_dir):
                     continue
 
-                save_json(os.path.join(tag_dir, "latest.json"), {"version_id": new_v_id})
-                t_all_data = self.uploader.load_json(f"{remote_tag_dir}/all.json", {"versions": []})
-                if new_v_id not in t_all_data["versions"]:
-                    t_all_data["versions"].append(new_v_id)
-                save_json(os.path.join(tag_dir, "all.json"), t_all_data)
+            save_json(os.path.join(tag_dir, "latest.json"), {"version_id": version_id})
+            t_all_data = self.uploader.load_json(f"{remote_tag_dir}/all.json", {"versions": []})
+            if version_id not in t_all_data["versions"]:
+                t_all_data["versions"].append(version_id)
+            save_json(os.path.join(tag_dir, "all.json"), t_all_data)
 
             if tag not in existing_versions["versions"]:
                 existing_versions["versions"].append(tag)
