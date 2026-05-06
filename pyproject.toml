@@ -15,4 +15,10 @@ dependencies = [
 ]
 
 [project.scripts]
-nimarchive-archiver = "nimarchive.archiver:main"
+nimarchive-archiver = "archive:main"
+
+[dependency-groups]
+dev = []
+
+[tool.setuptools]
+py-modules = ["archive"]

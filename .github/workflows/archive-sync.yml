@@ -33,11 +33,16 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install sync dependency
-        run: python -m pip install --upgrade pip internetarchive
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          version: "latest"
+
+      - name: Sync dependencies
+        run: uv sync --locked
 
       - name: Run archiver
-        run: python -m nimarchive.archiver
+        run: uv run archive.py
 
       - name: Commit archive updates
         run: |
@@ -50,7 +55,3 @@ jobs:
           fi
           git commit -m "chore: refresh archived packages"
           git push
-
-      - name: Sync to archive.org
-        if: ${{ env.ARCHIVE_ORG_IDENTIFIER != '' && env.ARCHIVE_ORG_ACCESS_KEY != '' && env.ARCHIVE_ORG_SECRET_KEY != '' }}
-        run: python -m nimarchive.sync_archive_org

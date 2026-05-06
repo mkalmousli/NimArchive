@@ -17,29 +17,27 @@ archive/
       code/
       versions/
 site/
-scripts/
-nimarchive/
 ```
 
-The Python package code lives in [`nimarchive/`](/mnt/MKSpace/Dev/NimArchive/nimarchive).
+The archiver entrypoint is [`archive.py`](/mnt/MKSpace/Dev/NimArchive/archive.py).
 The browser UI lives in [`site/`](/mnt/MKSpace/Dev/NimArchive/site).
 
 ## Run Once
 
 ```bash
-python3 -m nimarchive.archiver --archive-root archive --once
+uv run archive.py
 ```
 
 ## Run Periodically
 
 ```bash
-python3 -m nimarchive.archiver --archive-root archive --interval-hours 2
+uv run archive.py
 ```
 
 ## Use A Local Packages File
 
 ```bash
-python3 -m nimarchive.archiver --packages-file packages.json --archive-root archive --once
+uv run archive.py
 ```
 
 ## Site
@@ -47,8 +45,8 @@ python3 -m nimarchive.archiver --packages-file packages.json --archive-root arch
 Run the local server with:
 
 ```bash
-python3 -m nimarchive.server
+uv run python -m http.server 8000
 ```
 
-The GitHub Pages helper script is in
-[`scripts/update_github_pages_branch.sh`](/mnt/MKSpace/Dev/NimArchive/scripts/update_github_pages_branch.sh).
+GitHub Pages publishing is handled directly by
+[`archive.py`](/mnt/MKSpace/Dev/NimArchive/archive.py) before archive processing runs.

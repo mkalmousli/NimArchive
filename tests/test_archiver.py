@@ -5,7 +5,7 @@ import unittest
 from argparse import Namespace
 from pathlib import Path
 
-from nimarchive import archiver
+import archive as archiver
 
 
 class ArchiverTests(unittest.TestCase):
