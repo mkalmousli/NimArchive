@@ -1,4 +1,4 @@
-let body, root, header, mainContainer, sidebar, contentArea, searchInput, loadingHost, loadingLabel, loadingSubLabel, loadingSpinner, whyOverlay, whyDialog, packageCountLabel;
+let body, root, header, mainContainer, sidebar, contentArea, searchInput, loadingHost, loadingLabel, loadingSubLabel, loadingSpinner, whyOverlay, whyDialog, packageCountLabel, headerLeft, headerRight;
 let loadingToastCount = 0;
 
 function initLayout() {
@@ -88,40 +88,64 @@ function initLayout() {
     header = create("div", root, {
         display: "flex",
         justifyContent: "space-between",
-        alignItems: "center",
-        padding: "0 12px",
-        height: "36px",
+        alignItems: "flex-start",
+        gap: "12px",
+        padding: "10px 12px",
         borderBottom: "1px solid",
-        flexShrink: "0"
+        flexShrink: "0",
+        flexWrap: "wrap"
     });
 
-    const headerLeft = create("div", header, { display: "flex", flexDirection: "column", minWidth: "0" });
-    const title = create("div", headerLeft, {
+    headerLeft = create("div", header, {
+        display: "flex",
+        flexDirection: "column",
+        gap: "4px",
+        minWidth: "0",
+        flex: "1 1 320px"
+    });
+    const titleRow = create("div", headerLeft, {
+        display: "flex",
+        alignItems: "center",
+        gap: "8px",
+        flexWrap: "wrap",
+        minWidth: "0"
+    });
+    const title = create("div", titleRow, {
         fontWeight: "700",
-        fontSize: "13px",
-        letterSpacing: "-0.2px"
+        fontSize: "15px",
+        letterSpacing: "-0.3px",
+        lineHeight: "1.1"
     });
     title.textContent = "Nim Packages Archive";
+    packageCountLabel = create("div", titleRow, {
+        fontSize: "10px",
+        fontWeight: "600",
+        padding: "2px 7px",
+        borderRadius: "999px",
+        border: "1px solid",
+        whiteSpace: "nowrap"
+    });
+    packageCountLabel.textContent = "0 packages archived";
     const subtitle = create("div", headerLeft, {
         fontSize: "10px",
         opacity: "0.8",
-        whiteSpace: "nowrap",
+        lineHeight: "1.4",
         overflow: "hidden",
         textOverflow: "ellipsis"
     });
     subtitle.textContent = "Versioned snapshots, READMEs, licenses, and package history.";
-    packageCountLabel = create("div", headerLeft, {
-        fontSize: "10px",
-        opacity: "0.75",
-        marginTop: "2px"
-    });
-    packageCountLabel.textContent = "0 packages archived";
 
-    const headerRight = create("div", header, { display: "flex", gap: "8px", alignItems: "center" });
+    headerRight = create("div", header, {
+        display: "flex",
+        gap: "8px",
+        alignItems: "center",
+        flexWrap: "wrap",
+        justifyContent: "flex-end",
+        flex: "0 1 auto"
+    });
     const byline = create("a", headerRight, {
         fontSize: "10px",
-        textDecoration: "none",
-        whiteSpace: "nowrap"
+        textDecoration: "none"
     });
     byline.href = "https://mkalmousli.dev";
     byline.target = "_blank";
@@ -246,6 +270,13 @@ function applyTheme() {
     const theme = CONFIG[state.theme];
     s(body, { backgroundColor: theme.bg, color: theme.fg });
     s(header, { borderBottomColor: theme.border });
+    if (packageCountLabel) {
+        s(packageCountLabel, {
+            color: CONFIG.primary,
+            borderColor: theme.border,
+            backgroundColor: theme.surface
+        });
+    }
     s(sidebar, { borderRightColor: theme.border, backgroundColor: theme.surface });
     s(searchInput, { color: theme.fg, borderColor: theme.border });
     if (loadingHost) {
@@ -303,6 +334,24 @@ function handleResize() {
     state.height = window.innerHeight;
 
     const theme = CONFIG[state.theme];
+
+    if (state.width < 768) {
+        s(header, { alignItems: "stretch" });
+        if (headerRight) {
+            s(headerRight, {
+                width: "100%",
+                justifyContent: "flex-start"
+            });
+        }
+    } else {
+        s(header, { alignItems: "flex-start" });
+        if (headerRight) {
+            s(headerRight, {
+                width: "auto",
+                justifyContent: "flex-end"
+            });
+        }
+    }
 
     // root already has height/width 100% and overflow hidden
 
