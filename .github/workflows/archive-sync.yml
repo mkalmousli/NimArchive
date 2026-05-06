@@ -13,15 +13,9 @@ jobs:
     runs-on: ubuntu-latest
     env:
       MAX_PACKAGES: ${{ vars.MAX_PACKAGES || '' }}
-      ARCHIVE_ORG_IDENTIFIER: ${{ secrets.ARCHIVE_ORG_IDENTIFIER }}
-      ARCHIVE_ORG_ACCESS_KEY: ${{ secrets.ARCHIVE_ORG_ACCESS_KEY }}
-      ARCHIVE_ORG_SECRET_KEY: ${{ secrets.ARCHIVE_ORG_SECRET_KEY }}
-      ARCHIVE_ORG_COLLECTION: ${{ vars.ARCHIVE_ORG_COLLECTION || 'opensource' }}
-      ARCHIVE_ORG_TITLE: ${{ vars.ARCHIVE_ORG_TITLE || 'Nim Package Archive' }}
-      ARCHIVE_ORG_DESCRIPTION: ${{ vars.ARCHIVE_ORG_DESCRIPTION || 'Automated archive of Nim package source snapshots, metadata, README files, and licenses.' }}
-      ARCHIVE_ORG_CREATOR: ${{ vars.ARCHIVE_ORG_CREATOR || 'NimArchive' }}
-      ARCHIVE_ORG_MEDIATYPE: ${{ vars.ARCHIVE_ORG_MEDIATYPE || 'data' }}
-      ARCHIVE_ORG_LICENSEURL: ${{ vars.ARCHIVE_ORG_LICENSEURL || '' }}
+      DATA_REPO_SLUG: ${{ vars.DATA_REPO_SLUG || 'mkalmousli/NimArchiveData' }}
+      DATA_REPO_BRANCH: ${{ vars.DATA_REPO_BRANCH || 'main' }}
+      DATA_REPO_PUSH_TOKEN: ${{ secrets.DATA_REPO_PUSH_TOKEN }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4

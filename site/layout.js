@@ -315,7 +315,7 @@ function handleResize() {
     }
 }
 
-function showLoadingToast(message = "Loading...", details = "Fetching archive data from Archive.org") {
+function showLoadingToast(message = "Loading...", details = "Fetching archive data from the NimArchiveData repository") {
     loadingToastCount += 1;
     if (!loadingHost) return;
     const panel = loadingHost.firstChild;
@@ -341,7 +341,7 @@ function hideLoadingToast() {
     }, 180);
 }
 
-async function withLoadingToast(message, work, details = "Fetching archive data from Archive.org") {
+async function withLoadingToast(message, work, details = "Fetching archive data from the NimArchiveData repository") {
     showLoadingToast(message, details);
     try {
         return await work();

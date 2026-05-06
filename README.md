@@ -21,7 +21,7 @@ site/
 
 The archiver entrypoint is [`archive.py`](/mnt/MKSpace/Dev/NimArchive/archive.py).
 The browser UI lives in [`site/`](/mnt/MKSpace/Dev/NimArchive/site).
-Package snapshots are uploaded directly to Archive.org as each package finishes processing; they are not stored in the repository as a local archive tree.
+Package snapshots are written into the separate git repository `mkalmousli/NimArchiveData` as each package finishes processing.
 
 ## Run Once
 
@@ -51,3 +51,11 @@ uv run python -m http.server 8000
 
 GitHub Pages publishing is handled directly by
 [`archive.py`](/mnt/MKSpace/Dev/NimArchive/archive.py) before archive processing runs.
+
+## Data Repo
+
+The archiver expects a writable data repository.
+
+- Default repo: `mkalmousli/NimArchiveData`
+- Default branch: `main`
+- Workflow secret for pushes: `DATA_REPO_PUSH_TOKEN`
