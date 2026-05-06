@@ -147,6 +147,12 @@ def copy_tree(src, dst):
 def run_command(args, cwd=None, check=True, capture_output=False, text=True):
     return subprocess.run(args, cwd=cwd, check=check, capture_output=capture_output, text=text)
 
+def configure_git_identity(repo_dir):
+    user_name = os.environ.get("GIT_COMMITTER_NAME", "").strip() or os.environ.get("GITHUB_ACTOR", "").strip() or "github-actions[bot]"
+    user_email = os.environ.get("GIT_COMMITTER_EMAIL", "").strip() or "41898282+github-actions[bot]@users.noreply.github.com"
+    run_command(["git", "config", "user.name", user_name], cwd=repo_dir)
+    run_command(["git", "config", "user.email", user_email], cwd=repo_dir)
+
 def should_update_github_pages():
     return os.environ.get("SKIP_GITHUB_PAGES", "").strip().lower() not in {"1", "true", "yes"}
 
@@ -210,6 +216,7 @@ def update_github_pages_branch():
             logging.info("GitHub Pages branch is already up to date.")
             return
 
+        configure_git_identity(worktree_dir)
         run_command(["git", "commit", "-m", "chore: update GitHub Pages site"], cwd=worktree_dir)
         if run_command(["git", "remote", "get-url", "origin"], cwd=BASE_DIR, check=False, capture_output=True).returncode == 0:
             run_command(["git", "push", "-u", "origin", branch], cwd=worktree_dir)
