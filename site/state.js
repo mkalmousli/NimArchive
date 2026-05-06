@@ -1,6 +1,9 @@
 const CONFIG = {
     archiveBaseUrl: "https://archive.org/download/NimPackagesArchive",
-    corsProxyUrl: "https://api.allorigins.win/raw?url=",
+    archiveProxyChain: [
+        { type: "raw", prefix: "https://corsproxy.io/?url=" },
+        { type: "json", prefix: "https://whateverorigin.org/get?url=" },
+    ],
     primary: "#3b82f6",
     light: {
         bg: "#ffffff",
@@ -51,16 +54,31 @@ function addHover(el, normalStyles, hoverStyles) {
     el.addEventListener("mouseleave", () => s(el, normalStyles));
 }
 
-function proxiedArchiveUrl(path) {
-    return `${CONFIG.corsProxyUrl}${encodeURIComponent(`${CONFIG.archiveBaseUrl}/${path}`)}`;
-}
-
 async function fetchArchiveText(path) {
-    const response = await fetch(proxiedArchiveUrl(path));
-    if (!response.ok) {
-        throw new Error(`Archive fetch failed: ${response.status}`);
+    const targetUrl = `${CONFIG.archiveBaseUrl}/${path}`;
+    let lastError = null;
+
+    for (const proxy of CONFIG.archiveProxyChain) {
+        try {
+            const response = await fetch(`${proxy.prefix}${encodeURIComponent(targetUrl)}`);
+            if (!response.ok) {
+                throw new Error(`Proxy fetch failed: ${response.status}`);
+            }
+            if (proxy.type === "raw") {
+                return response.text();
+            }
+
+            const data = await response.json();
+            if (typeof data.contents !== "string") {
+                throw new Error("Proxy response did not include contents");
+            }
+            return data.contents;
+        } catch (error) {
+            lastError = error;
+        }
     }
-    return response.text();
+
+    throw lastError || new Error("Archive fetch failed");
 }
 
 async function fetchArchiveJson(path) {
