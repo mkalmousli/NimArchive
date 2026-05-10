@@ -3,6 +3,7 @@
 # requires-python = ">=3.11"
 # ///
 
+import base64
 import hashlib
 import json
 import logging
@@ -16,6 +17,8 @@ import tempfile
 import threading
 import time
 import urllib.request
+import urllib.error
+import urllib.parse
 
 
 logging.basicConfig(
@@ -31,6 +34,14 @@ REMOTE_INDEX_NAME = "index.json"
 REMOTE_PACKAGES_DIR = "packages"
 DEFAULT_DATA_REPO_SLUG = "mkalmousli/NimArchiveData"
 DEFAULT_DATA_REPO_BRANCH = "main"
+
+
+class PackageNameLockedError(Exception):
+    def __init__(self, name, existing_url, incoming_url):
+        super().__init__(f"Package name {name} is already locked to {existing_url}")
+        self.name = name
+        self.existing_url = existing_url
+        self.incoming_url = incoming_url
 
 
 def ensure_dir(directory):
@@ -195,12 +206,6 @@ def update_github_pages_branch():
             shutil.rmtree(worktree_dir, ignore_errors=True)
 
 
-def build_github_repo_url(repo_slug, token=None):
-    if token:
-        return f"https://x-access-token:{token}@github.com/{repo_slug}.git"
-    return f"https://github.com/{repo_slug}.git"
-
-
 class GitRepoStore:
     def __init__(self):
         self.repo_slug = os.environ.get("DATA_REPO_SLUG", DEFAULT_DATA_REPO_SLUG).strip() or DEFAULT_DATA_REPO_SLUG
@@ -208,12 +213,16 @@ class GitRepoStore:
         self.push_token = os.environ.get("DATA_REPO_PUSH_TOKEN", "").strip()
         if not self.push_token:
             raise RuntimeError("Missing required environment variable: DATA_REPO_PUSH_TOKEN")
-        self.clone_url = os.environ.get("DATA_REPO_CLONE_URL", "").strip() or build_github_repo_url(self.repo_slug)
-        self.push_url = os.environ.get("DATA_REPO_PUSH_URL", "").strip() or build_github_repo_url(self.repo_slug, self.push_token)
+        self.api_base = (os.environ.get("GITHUB_API_BASE_URL", "https://api.github.com").strip() or "https://api.github.com").rstrip("/")
         self.temp_dir = tempfile.mkdtemp(prefix="archive_data_repo_")
         self.repo_dir = os.path.join(self.temp_dir, "repo")
-        self.lock = threading.Lock()
-        self._clone_or_init_repo()
+        self.lock = threading.RLock()
+        self.remote_paths = set()
+        self.remote_paths_complete = True
+        self.current_commit_sha = None
+        self.current_tree_sha = None
+        self._branch_exists = False
+        self._fetch_remote_state()
         self.index = self.load_json(REMOTE_INDEX_NAME, {})
 
     def __enter__(self):
@@ -222,33 +231,108 @@ class GitRepoStore:
     def __exit__(self, exc_type, exc, tb):
         shutil.rmtree(self.temp_dir, ignore_errors=True)
 
-    def _clone_or_init_repo(self):
-        branch_exists = run_command(
-            ["git", "ls-remote", "--exit-code", "--heads", self.clone_url, self.branch],
-            check=False,
-            capture_output=True,
-        ).returncode == 0
+    def _api_headers(self, content_type=None):
+        headers = {
+            "Accept": "application/vnd.github+json",
+            "User-Agent": "NimArchive",
+            "X-GitHub-Api-Version": "2022-11-28",
+            "Authorization": f"Bearer {self.push_token}",
+        }
+        if content_type:
+            headers["Content-Type"] = content_type
+        return headers
 
-        if branch_exists:
-            run_command(["git", "clone", "--branch", self.branch, "--single-branch", self.clone_url, self.repo_dir])
+    def _api_url(self, path):
+        return f"{self.api_base}/repos/{self.repo_slug}/{path.lstrip('/')}"
+
+    def _request_json(self, method, path, payload=None, allow_404=False):
+        data = None
+        headers = self._api_headers()
+        if payload is not None:
+            data = json.dumps(payload).encode("utf-8")
+            headers["Content-Type"] = "application/json"
+        request = urllib.request.Request(self._api_url(path), data=data, headers=headers, method=method)
+        try:
+            with urllib.request.urlopen(request) as response:
+                raw = response.read().decode("utf-8")
+                return json.loads(raw) if raw else {}
+        except urllib.error.HTTPError as exc:
+            if allow_404 and exc.code == 404:
+                return None
+            message = exc.read().decode("utf-8", errors="replace")
+            raise RuntimeError(f"GitHub API request failed ({method} {path}): {exc.code} {message}") from exc
+
+    def _fetch_remote_state(self):
+        ref = self._request_json("GET", f"git/ref/heads/{urllib.parse.quote(self.branch, safe='')}", allow_404=True)
+        if not ref:
+            ensure_dir(self.repo_dir)
+            logging.info("GitHub data branch %s does not exist yet; starting from an empty mirror.", self.branch)
+            return
+
+        self._branch_exists = True
+        self.current_commit_sha = ref.get("object", {}).get("sha")
+        if not self.current_commit_sha:
+            return
+
+        commit = self._request_json("GET", f"git/commits/{self.current_commit_sha}", allow_404=True) or {}
+        self.current_tree_sha = commit.get("tree", {}).get("sha")
+        if self.current_tree_sha:
+            self._refresh_remote_paths(self.current_tree_sha)
+
+        ensure_dir(self.repo_dir)
+        logging.info("Configured GitHub API mirror for %s on branch %s.", self.repo_slug, self.branch)
+
+    def _refresh_remote_paths(self, tree_sha):
+        tree = self._request_json("GET", f"git/trees/{tree_sha}?recursive=1", allow_404=True) or {}
+        paths = set()
+        for entry in tree.get("tree", []):
+            if entry.get("type") == "blob" and entry.get("path"):
+                paths.add(entry["path"])
+        self.remote_paths = paths
+        self.remote_paths_complete = not bool(tree.get("truncated"))
+
+    def _remote_path_known(self, remote_name):
+        if os.path.exists(os.path.join(self.repo_dir, remote_name)):
+            return True
+        if self.remote_paths_complete:
+            return remote_name in self.remote_paths
+        return None
+
+    def _fetch_remote_file(self, remote_name):
+        local_path = os.path.join(self.repo_dir, remote_name)
+        ensure_dir(os.path.dirname(local_path))
+
+        contents = self._request_json(
+            "GET",
+            f"contents/{urllib.parse.quote(remote_name, safe='/')}?ref={urllib.parse.quote(self.branch, safe='')}",
+            allow_404=True,
+        )
+        if not contents or isinstance(contents, list) or contents.get("type") != "file":
+            return False
+
+        encoding = contents.get("encoding")
+        payload = contents.get("content", "")
+        if encoding == "base64":
+            data = base64.b64decode(payload.encode("utf-8"))
+            with open(local_path, "wb") as f:
+                f.write(data)
         else:
-            clone_result = run_command(["git", "clone", self.clone_url, self.repo_dir], check=False, capture_output=True)
-            if clone_result.returncode != 0:
-                ensure_dir(self.repo_dir)
-                run_command(["git", "init", "-b", self.branch], cwd=self.repo_dir)
-                run_command(["git", "remote", "add", "origin", self.clone_url], cwd=self.repo_dir)
-            elif run_command(["git", "show-ref", "--verify", "--quiet", f"refs/heads/{self.branch}"], cwd=self.repo_dir, check=False).returncode == 0:
-                run_command(["git", "checkout", self.branch], cwd=self.repo_dir)
-            else:
-                run_command(["git", "checkout", "--orphan", self.branch], cwd=self.repo_dir)
+            with open(local_path, "w", encoding="utf-8") as f:
+                f.write(payload)
 
-        configure_git_identity(self.repo_dir)
-        run_command(["git", "remote", "set-url", "--push", "origin", self.push_url], cwd=self.repo_dir, check=False)
-        logging.info("Configured data repo push remote for %s on branch %s.", self.repo_slug, self.branch)
+        self.remote_paths.add(remote_name)
+        return True
 
     def load_json(self, remote_name, default=None):
         with self.lock:
-            return get_json(os.path.join(self.repo_dir, remote_name), default)
+            local_path = os.path.join(self.repo_dir, remote_name)
+            if not os.path.exists(local_path):
+                known = self._remote_path_known(remote_name)
+                if known is False:
+                    return default if default is not None else {}
+                if known is None and not self._fetch_remote_file(remote_name):
+                    return default if default is not None else {}
+            return get_json(local_path, default)
 
     def get_index_snapshot(self):
         with self.lock:
@@ -257,7 +341,17 @@ class GitRepoStore:
     def reserve_package_id(self, name, pkg_type, url, license_name):
         with self.lock:
             if name in self.index:
-                return self.index[name]["id"], False
+                existing = self.index[name]
+                if not isinstance(existing, dict):
+                    raise PackageNameLockedError(name, "<invalid index entry>", url)
+
+                existing_id = existing.get("id") or name
+                existing_url = existing.get("url")
+                existing_type = existing.get("type")
+                if existing_url != url or existing_type != pkg_type:
+                    raise PackageNameLockedError(name, existing_url or "<missing url>", url)
+
+                return existing_id, False
 
             existing_ids = {entry["id"] for entry in self.index.values() if isinstance(entry, dict) and "id" in entry}
             proposed_id = name
@@ -276,18 +370,63 @@ class GitRepoStore:
             save_json(os.path.join(self.repo_dir, REMOTE_INDEX_NAME), self.index)
             return proposed_id, True
 
-    def _commit_and_push(self, message):
-        run_command(["git", "add", "."], cwd=self.repo_dir)
-        if run_command(["git", "diff", "--cached", "--quiet"], cwd=self.repo_dir, check=False).returncode == 0:
+    def _push_changed_files(self, changed_files, message):
+        changed_files = sorted({path for path in changed_files if os.path.exists(os.path.join(self.repo_dir, path))})
+        if not changed_files:
             return False
-        run_command(["git", "commit", "-m", message], cwd=self.repo_dir)
-        run_command(["git", "push", "-u", "origin", self.branch], cwd=self.repo_dir)
-        return True
+
+        with self.lock:
+            blobs = {}
+            for remote_path in changed_files:
+                local_path = os.path.join(self.repo_dir, remote_path)
+                with open(local_path, "rb") as f:
+                    content = base64.b64encode(f.read()).decode("ascii")
+                blob = self._request_json(
+                    "POST",
+                    "git/blobs",
+                    {"content": content, "encoding": "base64"},
+                )
+                blobs[remote_path] = blob["sha"]
+
+            tree_payload = {
+                "tree": [
+                    {"path": remote_path, "mode": "100644", "type": "blob", "sha": blobs[remote_path]}
+                    for remote_path in changed_files
+                ]
+            }
+            if self.current_tree_sha:
+                tree_payload["base_tree"] = self.current_tree_sha
+            tree = self._request_json("POST", "git/trees", tree_payload)
+
+            user_name = os.environ.get("GIT_COMMITTER_NAME", "").strip() or os.environ.get("GITHUB_ACTOR", "").strip() or "github-actions[bot]"
+            user_email = os.environ.get("GIT_COMMITTER_EMAIL", "").strip() or "41898282+github-actions[bot]@users.noreply.github.com"
+            commit_payload = {
+                "message": message,
+                "tree": tree["sha"],
+                "author": {"name": user_name, "email": user_email},
+                "committer": {"name": user_name, "email": user_email},
+            }
+            if self.current_commit_sha:
+                commit_payload["parents"] = [self.current_commit_sha]
+            commit = self._request_json("POST", "git/commits", commit_payload)
+
+            ref_path = f"git/refs/heads/{urllib.parse.quote(self.branch, safe='')}"
+            if self._branch_exists:
+                self._request_json("PATCH", ref_path, {"sha": commit["sha"]})
+            else:
+                self._request_json("POST", "git/refs", {"ref": f"refs/heads/{self.branch}", "sha": commit["sha"]})
+                self._branch_exists = True
+
+            self.current_commit_sha = commit["sha"]
+            self.current_tree_sha = tree["sha"]
+            self.remote_paths.update(changed_files)
+            self.remote_paths_complete = True
+            return True
 
     def upload_index_snapshot(self, package_name):
         with self.lock:
             save_json(os.path.join(self.repo_dir, REMOTE_INDEX_NAME), self.index)
-            changed = self._commit_and_push(f"chore: register package {package_name}")
+            changed = self._push_changed_files([REMOTE_INDEX_NAME], f"chore: register package {package_name}")
         if changed:
             logging.info("Pushed index.json after discovering package %s.", package_name)
         return changed
@@ -298,7 +437,22 @@ class GitRepoStore:
         return str(max(numeric_ids) + 1) if numeric_ids else "0"
 
     def remote_file_present(self, remote_name):
-        return os.path.exists(os.path.join(self.repo_dir, remote_name))
+        with self.lock:
+            known = self._remote_path_known(remote_name)
+            if known is not None:
+                return known
+            return self._fetch_remote_file(remote_name)
+
+    def ensure_remote_file_cached(self, remote_name):
+        with self.lock:
+            local_path = os.path.join(self.repo_dir, remote_name)
+            if os.path.exists(local_path):
+                return True
+
+            known = self._remote_path_known(remote_name)
+            if known is False:
+                return False
+            return self._fetch_remote_file(remote_name)
 
     def load_snapshot_metadata(self, remote_snapshot_dir):
         return self.load_json(f"{remote_snapshot_dir}/metadata.json", {})
@@ -327,6 +481,7 @@ class GitRepoStore:
             changed_items = []
             for remote_name, local_path in local_files.items():
                 target_path = os.path.join(self.repo_dir, remote_name)
+                self.ensure_remote_file_cached(remote_name)
                 source_md5 = calculate_md5(local_path)
                 if os.path.exists(target_path) and calculate_md5(target_path) == source_md5:
                     continue
@@ -338,7 +493,7 @@ class GitRepoStore:
                 logging.info("Data repo sync skipped for %s: no changed files.", package_name)
                 return 0
 
-            changed = self._commit_and_push(f"chore: archive {package_name}")
+            changed = self._push_changed_files(changed_items, f"chore: archive {package_name}")
 
         if changed:
             logging.info("Saved package %s into %s (%s files).", package_name, self.repo_slug, len(changed_items))
@@ -350,11 +505,29 @@ class Archiver:
     def __init__(self, store):
         self.store = store
 
-    def _select_snapshot_id(self, remote_parent_dir, history_key, latest_id, commit):
+    def _git_tree_hash(self, repo_path, commit):
+        try:
+            return subprocess.run(
+                ["git", "-C", repo_path, "rev-parse", f"{commit}^{{tree}}"],
+                capture_output=True,
+                text=True,
+                check=True,
+            ).stdout.strip()
+        except subprocess.CalledProcessError:
+            return ""
+
+    def _snapshot_matches(self, metadata, commit, source_hash):
+        if not metadata:
+            return False
+        if source_hash and metadata.get("source_hash") == source_hash:
+            return True
+        return metadata.get("commit") == commit
+
+    def _select_snapshot_id(self, remote_parent_dir, history_key, latest_id, commit, source_hash):
         if latest_id:
             latest_remote_dir = f"{remote_parent_dir}/{latest_id}"
             latest_meta = self.store.load_snapshot_metadata(latest_remote_dir)
-            if latest_meta.get("commit") == commit:
+            if self._snapshot_matches(latest_meta, commit, source_hash):
                 return latest_id, not self.store.snapshot_is_complete(latest_remote_dir, latest_meta)
             if not latest_meta:
                 return latest_id, True
@@ -363,7 +536,7 @@ class Archiver:
         for snapshot_id in history.get(history_key, []):
             remote_snapshot_dir = f"{remote_parent_dir}/{snapshot_id}"
             metadata = self.store.load_snapshot_metadata(remote_snapshot_dir)
-            if metadata.get("commit") == commit:
+            if self._snapshot_matches(metadata, commit, source_hash):
                 return snapshot_id, not self.store.snapshot_is_complete(remote_snapshot_dir, metadata)
 
         return self.store.get_next_id(f"{remote_parent_dir}/all.json", history_key), True
@@ -403,14 +576,17 @@ class Archiver:
 
         latest_data = self.store.load_json(f"{remote_code_dir}/latest.json", {})
         latest_code_id = latest_data.get("code")
-        code_id, needs_archive = self._select_snapshot_id(remote_code_dir, "codes", latest_code_id, commit)
+        source_hash = self._git_tree_hash(repo_path, commit)
+        code_id, needs_archive = self._select_snapshot_id(remote_code_dir, "codes", latest_code_id, commit, source_hash)
         target_dir = os.path.join(code_dir, code_id)
         archive_label = "latest"
 
         if needs_archive:
             logging.info("Archiving code state for %s (ID: %s)", branch, code_id)
-            if not self._do_archive(repo_path, package_name, archive_label, target_dir, commit, temp_dir):
+            if not self._do_archive(repo_path, package_name, archive_label, target_dir, commit, source_hash, temp_dir):
                 return False
+        else:
+            logging.info("Skipping code state for %s: source hash is already archived as ID %s.", branch, code_id)
 
         save_json(os.path.join(code_dir, "latest.json"), {"code": code_id})
         all_data = self.store.load_json(f"{remote_code_dir}/all.json", {"codes": []})
@@ -448,11 +624,14 @@ class Archiver:
             t_latest_data = self.store.load_json(f"{remote_tag_dir}/latest.json", {})
             t_latest_id = t_latest_data.get("version_id")
 
-            version_id, needs_archive = self._select_snapshot_id(remote_tag_dir, "versions", t_latest_id, commit)
+            source_hash = self._git_tree_hash(repo_path, commit)
+            version_id, needs_archive = self._select_snapshot_id(remote_tag_dir, "versions", t_latest_id, commit, source_hash)
             if needs_archive:
                 logging.info("Archiving tag %s (ID: %s)", tag, version_id)
-                if not self._do_archive(repo_path, package_name, tag, os.path.join(tag_dir, version_id), commit, temp_dir):
+                if not self._do_archive(repo_path, package_name, tag, os.path.join(tag_dir, version_id), commit, source_hash, temp_dir):
                     continue
+            else:
+                logging.info("Skipping tag %s: source hash is already archived as ID %s.", tag, version_id)
 
             save_json(os.path.join(tag_dir, "latest.json"), {"version_id": version_id})
             t_all_data = self.store.load_json(f"{remote_tag_dir}/all.json", {"versions": []})
@@ -467,7 +646,7 @@ class Archiver:
         if latest_tag:
             save_json(os.path.join(versions_dir, "latest.json"), {"version": latest_tag})
 
-    def _do_archive(self, repo_path, package_name, archive_label, target_dir, commit, temp_dir):
+    def _do_archive(self, repo_path, package_name, archive_label, target_dir, commit, source_hash, temp_dir):
         ensure_dir(target_dir)
         archive_name = f"{sanitize_name_part(package_name)}-{sanitize_name_part(archive_label)}.tar.gz"
         archive_file = os.path.join(target_dir, archive_name)
@@ -498,6 +677,8 @@ class Archiver:
                 metadata = {
                     "checksum": calculate_file_hash(archive_file),
                     "commit": commit,
+                    "source_hash": source_hash,
+                    "source_hash_kind": "git_tree",
                     "archived_at": int(time.time()),
                     "archive_name": archive_name,
                 }
@@ -511,6 +692,8 @@ class Archiver:
             if os.path.exists(temp_export):
                 shutil.rmtree(temp_export)
         return False
+
+
 def process_package(archiver, package_info):
     index, total, pkg = package_info
     name = pkg.get("name")
@@ -529,6 +712,14 @@ def process_package(archiver, package_info):
     try:
         success = archiver.archive_git_repo(name, url, pkg.get("license"))
         return {"name": name, "status": "ok" if success else "failed"}
+    except PackageNameLockedError as e:
+        logging.warning(
+            "Skipping %s: package name is already locked to %s; incoming URL was %s.",
+            e.name,
+            e.existing_url,
+            e.incoming_url,
+        )
+        return {"name": name, "status": "skipped", "reason": "name_locked"}
     except Exception as e:
         logging.exception("Unexpected failure while processing %s", name)
         return {"name": name, "status": "failed", "reason": str(e)}

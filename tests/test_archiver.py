@@ -1,132 +1,107 @@
 import json
-import subprocess
+import os
+import shutil
 import tempfile
+import threading
 import unittest
-from argparse import Namespace
 from pathlib import Path
 
 import archive as archiver
 
 
 class ArchiverTests(unittest.TestCase):
-    def test_package_folder_base_is_simple_and_url_safe(self) -> None:
-        self.assertEqual(archiver.package_folder_base("humanize"), "humanize")
-        self.assertEqual(archiver.package_folder_base("bad name!"), "bad_name")
+    def test_existing_package_name_is_locked_to_original_url(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = self.make_store(Path(tmp) / "repo")
 
-    def test_first_package_keeps_name_and_duplicates_get_suffixes(self) -> None:
-        index: dict[str, object] = {}
-        first = archiver.PackageEntry("humanize", "https://example.invalid/one", "git", {})
-        second = archiver.PackageEntry("humanize", "https://example.invalid/two", "git", {})
+            pkg_id, is_new = store.reserve_package_id("humanize", "git", "https://example.invalid/one", "MIT")
+            self.assertEqual(pkg_id, "humanize")
+            self.assertTrue(is_new)
 
-        self.assertEqual(archiver.ensure_index_entry(index, first), "humanize")
-        self.assertEqual(archiver.ensure_index_entry(index, second), "humanize1")
+            pkg_id, is_new = store.reserve_package_id("humanize", "git", "https://example.invalid/one", "MIT")
+            self.assertEqual(pkg_id, "humanize")
+            self.assertFalse(is_new)
 
-    def test_git_snapshot_uses_unix_names_and_package_indexes(self) -> None:
+            before = json.loads(json.dumps(store.index))
+            with self.assertRaises(archiver.PackageNameLockedError):
+                store.reserve_package_id("humanize", "git", "https://example.invalid/two", "MIT")
+            self.assertEqual(store.index, before)
+
+    def test_upload_tree_fetches_known_remote_file_and_skips_same_hash(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            repo = root / "repo"
-            repo.mkdir()
-            self.run_git(["init"], repo)
-            self.run_git(["config", "user.email", "test@example.invalid"], repo)
-            self.run_git(["config", "user.name", "Test"], repo)
-            (repo / "testpkg.nimble").write_text('version = "0.1.0"\n', encoding="utf-8")
-            self.run_git(["add", "testpkg.nimble"], repo)
-            self.run_git(["commit", "-m", "initial"], repo)
-            self.run_git(["tag", "v0.1.0"], repo)
-            (repo / "testpkg.nimble").write_text('version = "0.2.0"\n', encoding="utf-8")
-            self.run_git(["add", "testpkg.nimble"], repo)
-            self.run_git(["commit", "-m", "second"], repo)
+            store = self.make_store(root / "repo")
+            remote = root / "remote"
+            upload = root / "upload"
+            remote.mkdir()
+            upload.mkdir()
+            (remote / "index.json").write_text('{"humanize": {"id": "humanize"}}\n', encoding="utf-8")
+            (upload / "index.json").write_text('{"humanize": {"id": "humanize"}}\n', encoding="utf-8")
 
-            packages_file = root / "packages.json"
-            packages_file.write_text(
-                json.dumps(
-                    [
-                        {
-                            "name": "testpkg",
-                            "url": str(repo),
-                            "method": "git",
-                            "tags": [],
-                            "description": "test",
-                            "license": "MIT",
-                        }
-                    ]
-                ),
-                encoding="utf-8",
-            )
+            fetched = []
+            pushed = []
+            store.remote_paths = {"index.json"}
 
-            args = Namespace(
-                archive_root=str(root / "archive"),
-                packages_file=str(packages_file),
-                packages_url=archiver.DEFAULT_PACKAGES_URL,
-                http_timeout=30.0,
-                package=None,
-                limit=None,
-                force=False,
-            )
+            def fetch(remote_name):
+                fetched.append(remote_name)
+                target = Path(store.repo_dir) / remote_name
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(remote / remote_name, target)
+                return True
 
-            self.assertEqual(archiver.run_once(args), 0)
+            def push(changed_files, message):
+                pushed.extend(changed_files)
+                return True
 
-            package_dir = root / "archive" / "packages" / "testpkg"
-            code_dir = package_dir / "code"
-            versions_dir = package_dir / "versions"
-            self.assertTrue(code_dir.exists())
-            self.assertTrue(versions_dir.exists())
-            self.assertFalse((package_dir / "snapshots").exists())
-            self.assertFalse((package_dir / "package.json").exists())
-            self.assertFalse((package_dir / "index.json").exists())
+            store._fetch_remote_file = fetch
+            store._push_changed_files = push
 
-            index = json.loads((root / "archive" / "index.json").read_text(encoding="utf-8"))
-            self.assertEqual(
-                index,
-                {
-                    "schema_version": 1,
-                    "testpkg": {"type": "git", "url": str(repo)},
-                },
-            )
+            self.assertEqual(store.upload_tree(str(upload), "humanize"), 0)
+            self.assertEqual(fetched, ["index.json"])
+            self.assertEqual(pushed, [])
 
-            code_history = json.loads((code_dir / "all.json").read_text(encoding="utf-8"))
-            self.assertEqual(code_history["schema_version"], 1)
-            self.assertEqual(len(code_history["snapshots"]), 1)
-            code_stamp = code_history["snapshots"][0]
-            self.assertEqual(code_stamp, "0")
-            self.assertEqual(
-                (code_dir / code_stamp / "code.tar.gz").exists(),
-                True,
-            )
-            self.assertTrue((code_dir / code_stamp / "metadata.json").exists())
-            code_latest = json.loads((code_dir / "latest.json").read_text(encoding="utf-8"))
-            self.assertEqual(code_latest["snapshot"], code_stamp)
+    def test_snapshot_selection_reuses_same_source_hash(self) -> None:
+        class FakeStore:
+            def load_snapshot_metadata(self, remote_snapshot_dir):
+                if remote_snapshot_dir == "packages/humanize/code/0":
+                    return {
+                        "commit": "old-commit",
+                        "source_hash": "same-tree",
+                        "archive_name": "humanize-latest.tar.gz",
+                    }
+                return {}
 
-            versions_json = json.loads((versions_dir / "all.json").read_text(encoding="utf-8"))
-            self.assertEqual(versions_json["schema_version"], 1)
-            self.assertEqual(versions_json["latest"], "0.1.0")
-            self.assertEqual(set(versions_json["versions"]), {"0.1.0"})
+            def snapshot_is_complete(self, remote_snapshot_dir, metadata):
+                return True
 
-            for version in ("0.1.0",):
-                version_dir = versions_dir / version
-                self.assertTrue(version_dir.exists())
-                archives = list(version_dir.glob("*.tar.gz"))
-                self.assertEqual(len(archives), 1)
-                # The ID for v0.1.0 should be "1" because HEAD (v0.2.0) was archived first as "0"
-                v_id = archives[0].name.removesuffix(".tar.gz")
-                self.assertEqual(v_id, "1")
-                
-                metadata_files = list(version_dir.glob("*.metadata.json"))
-                self.assertEqual(len(metadata_files), 1)
-                
-                # Check latest.json inside version directory
-                v_latest = json.loads((version_dir / "latest.json").read_text(encoding="utf-8"))
-                self.assertEqual(v_latest["snapshot"], v_id)
-                
-                # Verify metadata fields
-                v_meta = json.loads(metadata_files[0].read_text(encoding="utf-8"))
-                self.assertEqual(v_meta["code"], v_id)
-                self.assertIn("stamp", v_meta)
-                self.assertNotEqual(v_meta["stamp"], v_meta["code"])
+            def load_json(self, remote_name, default=None):
+                return {"codes": ["0"]}
+
+            def get_next_id(self, remote_name, key):
+                return "1"
+
+        archive = archiver.Archiver(FakeStore())
+        snapshot_id, needs_archive = archive._select_snapshot_id(
+            "packages/humanize/code",
+            "codes",
+            "0",
+            "new-commit",
+            "same-tree",
+        )
+        self.assertEqual(snapshot_id, "0")
+        self.assertFalse(needs_archive)
 
     @staticmethod
-    def run_git(args: list[str], cwd: Path) -> None:
-        subprocess.run(["git", *args], cwd=cwd, check=True, stdout=subprocess.PIPE)
+    def make_store(repo_dir: Path):
+        store = object.__new__(archiver.GitRepoStore)
+        store.repo_slug = "example/archive"
+        store.repo_dir = str(repo_dir)
+        store.lock = threading.RLock()
+        store.remote_paths = set()
+        store.remote_paths_complete = True
+        store.index = {}
+        os.makedirs(store.repo_dir, exist_ok=True)
+        return store
 
 
 if __name__ == "__main__":
